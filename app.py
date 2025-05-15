@@ -14,6 +14,7 @@ from urllib.parse import urlparse, parse_qs
 import shutil
 import uuid
 import codecs
+from bs4 import BeautifulSoup
 
 def authenticate_user():
     if "authenticated" not in st.session_state:
@@ -133,94 +134,60 @@ def download_image(url, temp_dir):
         if not parsed_url.scheme or not parsed_url.netloc:
             return None, f"Nieprawidłowy URL: {url}"
 
-        # Ustawienie nagłówków HTTP
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/91.0.4472.124 Safari/537.36"
             ),
-            "Accept": (
-                "image/avif,image/webp,image/apng,image/svg+xml,"
-                "image/*,*/*;q=0.8"
-            ),
+            "Accept": "*/*",
             "Accept-Language": "pl,en-US;q=0.9,en;q=0.8",
             "Referer": f"{parsed_url.scheme}://{parsed_url.netloc}/",
         }
 
-        # Specjalna obsługa dla api.rmgastro.com
-        if "api.rmgastro.com" in url:
-            headers["Referer"] = "https://api.rmgastro.com/"
+        # Obsługa RM Gastro - link nie jest obrazem, trzeba wyciągnąć src z <img>
+        if "api.rmgastro.com/image_show.php" in url:
+            session = requests.Session()
+            html_resp = session.get(url, headers=headers, timeout=10)
+            html_resp.raise_for_status()
 
-        # Użycie sesji requests
-        session = requests.Session()
-        response = session.get(
-            url, stream=True, timeout=30, headers=headers, allow_redirects=True
-        )
+            soup = BeautifulSoup(html_resp.text, "html.parser")
+            img_tag = soup.find("img")
+            if not img_tag or not img_tag.get("src"):
+                return None, "Nie znaleziono znacznika <img> z obrazem"
+
+            img_src = img_tag["src"]
+            if not img_src.startswith("http"):
+                img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}"
+            else:
+                img_url = img_src
+
+            url = img_url  # teraz mamy właściwy link do obrazu
+
+        # teraz już normalne pobieranie obrazka
+        response = requests.get(url, stream=True, timeout=30, headers=headers)
         response.raise_for_status()
 
         content_type = response.headers.get("Content-Type", "")
         if not content_type.startswith("image/"):
-            return None, (
-                f"URL {url} nie prowadzi do obrazu "
-                f"(Content-Type: {content_type})"
-            )
+            return None, f"Nieprawidłowy Content-Type: {content_type}"
 
-        # Określenie nazwy pliku
-        filename = None
-        if "Content-Disposition" in response.headers:
-            content_disp = response.headers["Content-Disposition"]
-            match = re.search(r'filename="?([^"]+)"?', content_disp)
-            if match:
-                filename = match.group(1)
+        filename = os.path.basename(urlparse(url).path)
+        if not filename or "." not in filename:
+            filename = f"image_{uuid.uuid4().hex}.jpg"
 
-        if not filename:
-            path = parsed_url.path
-            filename = os.path.basename(path) if path else ""
-
-        if not filename:
-            query = parse_qs(parsed_url.query)
-            if "art_id" in query and "artv_id" in query:
-                filename = f"image_{query['art_id'][0]}_{query['artv_id'][0]}"
-            elif "artv_id" in query:
-                filename = f"image_{query['artv_id'][0]}"
-            elif "art_id" in query:
-                filename = f"image_{query['art_id'][0]}"
-            else:
-                filename = f"image_{uuid.uuid4().hex}"
-
-        # Dodanie rozszerzenia pliku na podstawie Content-Type
-        if not os.path.splitext(filename)[1]:
-            if "jpeg" in content_type or "jpg" in content_type:
-                filename += ".jpg"
-            elif "png" in content_type:
-                filename += ".png"
-            elif "gif" in content_type:
-                filename += ".gif"
-            elif "webp" in content_type:
-                filename += ".webp"
-            else:
-                filename += ".jpg"
-
-        # Zapisanie pliku
         file_path = os.path.join(temp_dir, filename)
         with open(file_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
+            for chunk in response.iter_content(8192):
                 f.write(chunk)
 
         if os.path.exists(file_path) and os.path.getsize(file_path) > 100:
-            return {
-                "path": file_path,
-                "filename": filename,
-                "original_url": url,
-            }, None
+            return {"path": file_path, "filename": filename, "original_url": url}, None
         else:
-            return None, f"Pobrano pusty lub niepełny plik z URL: {url}"
+            return None, "Pobrano pusty plik"
 
-    except requests.exceptions.RequestException as e:
-        return None, f"Błąd podczas pobierania obrazu {url}: {str(e)}"
     except Exception as e:
-        return None, f"Nieoczekiwany błąd: {str(e)}"
+        return None, f"Błąd: {str(e)}"
 
 
 def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
