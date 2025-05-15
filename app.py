@@ -10,7 +10,7 @@ import pandas as pd
 import io
 import ftplib
 import xml.etree.ElementTree as ET
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import shutil
 import uuid
 import codecs
@@ -140,20 +140,48 @@ def download_image(url, temp_dir):
         if not parsed_url.scheme or not parsed_url.netloc:
             return None, f"Nieprawidłowy URL: {url}"
 
-        response = requests.get(url, stream=True, timeout=30)
+        # Dodaj User-Agent, aby uniknąć blokady przez serwery
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+
+        # Pobierz obraz z pełnym śledzeniem przekierowań
+        response = requests.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True)
         response.raise_for_status()
 
+        # Określenie nazwy pliku
+        filename = None
+
+        # 1. Spróbuj pobrać nazwę z nagłówka Content-Disposition
         if "Content-Disposition" in response.headers:
             content_disp = response.headers["Content-Disposition"]
             filename_match = re.search(r'filename="?([^"]+)"?', content_disp)
             if filename_match:
                 filename = filename_match.group(1)
-            else:
-                filename = os.path.basename(parsed_url.path) or f"image_{uuid.uuid4().hex}"
-        else:
-            filename = os.path.basename(parsed_url.path) or f"image_{uuid.uuid4().hex}"
 
+        # 2. Jeśli nie znaleziono, spróbuj pobrać z ścieżki URL
+        if not filename:
+            path = parsed_url.path
+            if path and path != "/" and os.path.basename(path):
+                filename = os.path.basename(path)
+
+        # 3. Jeśli nadal nie mamy nazwy, generuj unikalną nazwę z parametrów URL lub UUID
+        if not filename or filename == "image_show.php":
+            # Sprawdź, czy URL ma parametry (np. art_id)
+            query_params = parse_qs(parsed_url.query)
+            if 'art_id' in query_params:
+                art_id = query_params['art_id'][0]
+                filename = f"image_{art_id}.jpg"
+            elif 'artv_id' in query_params:
+                artv_id = query_params['artv_id'][0]
+                filename = f"image_{artv_id}.jpg"
+            else:
+                # Ostateczność - wygeneruj unikalny identyfikator
+                filename = f"image_{uuid.uuid4().hex}.jpg"
+
+        # Sprawdź, czy nazwa pliku ma rozszerzenie
         if not os.path.splitext(filename)[1]:
+            # Dodaj rozszerzenie na podstawie typu MIME
             content_type = response.headers.get("Content-Type", "")
             if "jpeg" in content_type or "jpg" in content_type:
                 filename += ".jpg"
@@ -164,13 +192,20 @@ def download_image(url, temp_dir):
             elif "webp" in content_type:
                 filename += ".webp"
             else:
+                # Domyślnie użyj JPG
                 filename += ".jpg"
 
+        # Zapisz plik
         file_path = os.path.join(temp_dir, filename)
         with open(file_path, 'wb') as f:
-            shutil.copyfileobj(response.raw, f)
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
 
-        return {"path": file_path, "filename": filename, "original_url": url}, None
+        # Sprawdź, czy plik został zapisany i ma rozmiar większy niż 0
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            return {"path": file_path, "filename": filename, "original_url": url}, None
+        else:
+            return None, f"Pobrano pusty plik dla URL: {url}"
 
     except requests.exceptions.RequestException as e:
         return None, f"Błąd podczas pobierania obrazu {url}: {str(e)}"
@@ -179,14 +214,25 @@ def download_image(url, temp_dir):
 
 def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
     try:
+        # Sprawdź, czy plik istnieje
+        if not os.path.exists(file_path):
+            return {"success": False, "error": f"Plik nie istnieje: {file_path}"}
+
+        # Sprawdź, czy plik ma zawartość
+        if os.path.getsize(file_path) == 0:
+            return {"success": False, "error": f"Plik jest pusty: {file_path}"}
+
+        # Połącz z serwerem FTP
         ftp = ftplib.FTP()
         ftp.connect(ftp_settings["host"], ftp_settings["port"])
         ftp.login(ftp_settings["username"], ftp_settings["password"])
 
+        # Przejdź do katalogu docelowego
         if ftp_settings["directory"] and ftp_settings["directory"] != "/":
             try:
                 ftp.cwd(ftp_settings["directory"])
             except ftplib.error_perm:
+                # Jeśli katalog nie istnieje, utwórz go
                 dirs = ftp_settings["directory"].strip("/").split("/")
                 for directory in dirs:
                     if directory:
@@ -196,22 +242,30 @@ def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
                             ftp.mkd(directory)
                             ftp.cwd(directory)
 
+        # Określ nazwę pliku na serwerze
         if not remote_filename:
             remote_filename = os.path.basename(file_path)
 
+        # Prześlij plik
         with open(file_path, 'rb') as file:
             ftp.storbinary(f'STOR {remote_filename}', file)
 
-        file_url = f"ftp://{ftp_settings['username']}:***@{ftp_settings['host']}"
+        # Generuj URL do pliku
+        ftp_url = f"ftp://{ftp_settings['host']}"
         if ftp_settings["directory"] and ftp_settings["directory"] != "/":
-            file_url += f"{ftp_settings['directory']}"
-        if not file_url.endswith("/"):
-            file_url += "/"
-        file_url += remote_filename
+            if not ftp_settings["directory"].startswith("/"):
+                ftp_url += "/"
+            ftp_url += ftp_settings["directory"]
+            if not ftp_url.endswith("/"):
+                ftp_url += "/"
+        else:
+            ftp_url += "/"
+        ftp_url += remote_filename
 
+        # Zamknij połączenie
         ftp.quit()
 
-        return {"success": True, "url": file_url, "filename": remote_filename}
+        return {"success": True, "url": ftp_url, "filename": remote_filename}
 
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -508,11 +562,19 @@ def main():
             else:
                 st.success(f"Znaleziono {len(urls)} URL-i zdjęć")
 
+                # Wyświetl pierwsze 5 URL-i dla debugowania
+                with st.expander("Podgląd znalezionych URL-i"):
+                    for i, url in enumerate(urls[:5]):
+                        st.write(f"{i+1}. {url}")
+                    if len(urls) > 5:
+                        st.write(f"... oraz {len(urls)-5} więcej.")
+
                 if not st.session_state.ftp_settings["host"] or not st.session_state.ftp_settings["username"]:
                     st.error("Podaj dane serwera FTP.")
                 else:
                     progress_bar = st.progress(0)
                     status_text = st.empty()
+                    debug_area = st.empty()
 
                     with tempfile.TemporaryDirectory() as tmpdirname:
                         downloaded_images = []
@@ -522,11 +584,18 @@ def main():
                             status_text.text(f"Przetwarzanie {i+1}/{len(urls)}: {url}")
                             progress_bar.progress((i) / len(urls))
 
+                            # Pobierz obraz
+                            debug_area.info(f"Pobieranie obrazu: {url}")
                             image_info, error = download_image(url, tmpdirname)
-                            if error:
-                                st.warning(f"Nie udało się pobrać {url}: {error}")
-                                continue
 
+                            if error:
+                                debug_area.warning(f"Nie udało się pobrać {url}: {error}")
+                                continue
+                            else:
+                                debug_area.success(f"Pobrano obraz: {image_info['filename']} ({os.path.getsize(image_info['path'])} bajtów)")
+
+                            # Prześlij na FTP
+                            debug_area.info(f"Przesyłanie na FTP: {image_info['filename']}")
                             upload_result = upload_to_ftp(
                                 image_info["path"], 
                                 st.session_state.ftp_settings
@@ -539,18 +608,27 @@ def main():
                                     "filename": upload_result["filename"]
                                 })
 
+                                debug_area.success(f"Przesłano na FTP: {upload_result['filename']}")
+
+                                # Utwórz URL FTP bez danych logowania do pokazania w XML
                                 ftp_url = f"ftp://{st.session_state.ftp_settings['host']}"
                                 if st.session_state.ftp_settings["directory"] and st.session_state.ftp_settings["directory"] != "/":
-                                    ftp_url += f"{st.session_state.ftp_settings['directory']}"
-                                if not ftp_url.endswith("/"):
+                                    if not st.session_state.ftp_settings["directory"].startswith("/"):
+                                        ftp_url += "/"
+                                    ftp_url += st.session_state.ftp_settings["directory"]
+                                    if not ftp_url.endswith("/"):
+                                        ftp_url += "/"
+                                else:
                                     ftp_url += "/"
                                 ftp_url += upload_result["filename"]
+
                                 new_urls_map[url] = ftp_url
                             else:
-                                st.warning(f"Nie udało się przesłać {url} na FTP: {upload_result['error']}")
+                                debug_area.warning(f"Nie udało się przesłać {image_info['filename']} na FTP: {upload_result['error']}")
 
                         progress_bar.progress(1.0)
                         status_text.text(f"Zakończono przetwarzanie. Pobrano i przesłano {len(downloaded_images)} z {len(urls)} zdjęć.")
+                        debug_area.empty()
 
                         st.session_state.downloaded_images = downloaded_images
 
