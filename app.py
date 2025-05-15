@@ -14,7 +14,6 @@ from urllib.parse import urlparse, parse_qs
 import shutil
 import uuid
 import codecs
-import BeautifulSoup
 
 def authenticate_user():
     if "authenticated" not in st.session_state:
