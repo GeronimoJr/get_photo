@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 import shutil
 import uuid
+import codecs
 
 def authenticate_user():
     if "authenticated" not in st.session_state:
@@ -70,21 +71,43 @@ def read_file_content(uploaded_file):
         if file_type not in ["xml", "csv"]:
             return None, "Nieobsługiwany typ pliku. Akceptowane formaty to XML i CSV."
 
+        # Specjalna obsługa dla plików XML
         if file_type == "xml":
-            encoding_declared = re.search(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', raw_bytes)
-            encodings_to_try = [encoding_declared.group(1).decode('ascii')] if encoding_declared else []
-
-            if encodings_to_try and encodings_to_try[0].lower() == 'utf-16':
+            # Sprawdź BOM i kodowanie
+            if raw_bytes.startswith(codecs.BOM_UTF16_LE) or raw_bytes.startswith(codecs.BOM_UTF16_BE):
                 try:
-                    file_contents = raw_bytes.decode('utf-16')
+                    # UTF-16 z BOM
+                    if raw_bytes.startswith(codecs.BOM_UTF16_LE):
+                        file_contents = raw_bytes.decode('utf-16-le')
+                    else:
+                        file_contents = raw_bytes.decode('utf-16-be')
+
                     return {"content": file_contents, "raw_bytes": raw_bytes, 
                             "type": file_type, "encoding": 'utf-16', "name": uploaded_file.name}, None
                 except UnicodeDecodeError:
                     pass
-        else:
-            encodings_to_try = []
 
-        encodings_to_try += ["utf-8", "iso-8859-2", "windows-1250", "utf-16", "utf-16le", "utf-16be"]
+            # Wykryj kodowanie z deklaracji XML
+            encoding_declared = re.search(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', raw_bytes)
+            if encoding_declared:
+                declared_encoding = encoding_declared.group(1).decode('ascii').lower()
+                try:
+                    if declared_encoding.startswith('utf-16'):
+                        # Próbuj obie wersje UTF-16
+                        try:
+                            file_contents = raw_bytes.decode('utf-16-le')
+                        except UnicodeDecodeError:
+                            file_contents = raw_bytes.decode('utf-16-be')
+                    else:
+                        file_contents = raw_bytes.decode(declared_encoding)
+
+                    return {"content": file_contents, "raw_bytes": raw_bytes, 
+                            "type": file_type, "encoding": declared_encoding, "name": uploaded_file.name}, None
+                except (UnicodeDecodeError, LookupError):
+                    pass
+
+        # Standardowa obsługa dla wszystkich plików
+        encodings_to_try = ["utf-8", "iso-8859-2", "windows-1250", "utf-16-le", "utf-16-be"]
 
         for enc in encodings_to_try:
             try:
@@ -94,6 +117,7 @@ def read_file_content(uploaded_file):
             except UnicodeDecodeError:
                 continue
 
+        # Jeśli żadne kodowanie nie działa, spróbuj wczytać jako binarny
         if file_type == "csv":
             try:
                 buffer = io.BytesIO(raw_bytes)
@@ -102,7 +126,7 @@ def read_file_content(uploaded_file):
                 return {"content": file_contents, "raw_bytes": raw_bytes, 
                         "type": file_type, "encoding": "auto-detected", 
                         "name": uploaded_file.name, "dataframe": df}, None
-            except Exception as e:
+            except Exception:
                 pass
 
         return None, "Nie udało się odczytać pliku – nieznane kodowanie."
@@ -197,33 +221,60 @@ def extract_image_urls_from_xml(xml_content, xpath, separator=","):
         if not xml_content or not xml_content.strip():
             return None, "Plik XML jest pusty"
 
+        # Usuń BOM, jeśli istnieje
         if xml_content.startswith("\ufeff"):
             xml_content = xml_content[1:]
 
+        # Użyj biblioteki lxml zamiast ElementTree, jeśli jest dostępna
         try:
-            root = ET.fromstring(xml_content)
-        except ET.ParseError as e:
+            from lxml import etree
+            parser = etree.XMLParser(recover=True)
+            root = etree.fromstring(xml_content.encode('utf-8'), parser)
+
+            # Konwersja XPath do formatu lxml
+            namespaces = {}
+            elements = root.xpath(xpath, namespaces=namespaces)
+
+            urls = []
+            for element in elements:
+                element_text = element.text
+                if element_text:
+                    if separator in element_text:
+                        for url in element_text.split(separator):
+                            url = url.strip()
+                            if url:
+                                urls.append(url)
+                    else:
+                        urls.append(element_text.strip())
+
+            return urls, None
+        except ImportError:
+            # Fallback do ElementTree
             try:
-                xml_bytes = xml_content.encode("utf-8")
-                root = ET.fromstring(xml_bytes)
-            except Exception as inner_e:
-                return None, f"Błąd podczas parsowania XML: {str(e)}. Dodatkowy błąd: {str(inner_e)}"
+                root = ET.fromstring(xml_content)
+            except ET.ParseError:
+                # Jeśli parsowanie nie powiodło się, spróbuj usunąć problematyczne znaki
+                xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
+                try:
+                    root = ET.fromstring(xml_content)
+                except ET.ParseError as e:
+                    return None, f"Błąd podczas parsowania XML: {str(e)}"
 
-        urls = []
-        elements = root.findall(xpath)
+            urls = []
+            elements = root.findall(xpath)
 
-        for element in elements:
-            element_text = element.text
-            if element_text:
-                if separator in element_text:
-                    for url in element_text.split(separator):
-                        url = url.strip()
-                        if url:
-                            urls.append(url)
-                else:
-                    urls.append(element_text.strip())
+            for element in elements:
+                element_text = element.text
+                if element_text:
+                    if separator in element_text:
+                        for url in element_text.split(separator):
+                            url = url.strip()
+                            if url:
+                                urls.append(url)
+                    else:
+                        urls.append(element_text.strip())
 
-        return urls, None
+            return urls, None
 
     except Exception as e:
         return None, f"Nieoczekiwany błąd: {str(e)}"
@@ -254,26 +305,55 @@ def extract_image_urls_from_csv(csv_content, column_name, separator=","):
 
 def update_xml_with_new_urls(xml_content, xpath, new_urls_map, new_node_name):
     try:
-        root = ET.fromstring(xml_content)
+        # Usuń BOM, jeśli istnieje
+        if xml_content.startswith("\ufeff"):
+            xml_content = xml_content[1:]
 
-        elements = root.findall(xpath)
+        # Próba użycia lxml do aktualizacji XML
+        try:
+            from lxml import etree
+            parser = etree.XMLParser(recover=True)
+            root = etree.fromstring(xml_content.encode('utf-8'), parser)
 
-        for element in elements:
-            if element.text in new_urls_map:
-                parent = None
-                for potential_parent in root.iter():
-                    if element in list(potential_parent):
-                        parent = potential_parent
-                        break
+            # Konwersja XPath do formatu lxml
+            namespaces = {}
+            elements = root.xpath(xpath, namespaces=namespaces)
 
-                if parent is not None:
-                    new_element = ET.Element(new_node_name)
-                    new_element.text = new_urls_map[element.text]
+            for element in elements:
+                if element.text in new_urls_map:
+                    parent = element.getparent()
+                    if parent is not None:
+                        new_element = etree.Element(new_node_name)
+                        new_element.text = new_urls_map[element.text]
 
-                    parent_index = list(parent).index(element)
-                    parent.insert(parent_index + 1, new_element)
+                        # Wstaw nowy element po oryginalnym
+                        parent_index = parent.index(element)
+                        parent.insert(parent_index + 1, new_element)
 
-        return ET.tostring(root, encoding='unicode'), None
+            # Konwersja z powrotem do stringa
+            return etree.tostring(root, encoding='unicode', pretty_print=True), None
+        except ImportError:
+            # Fallback do ElementTree
+            root = ET.fromstring(xml_content)
+
+            elements = root.findall(xpath)
+
+            for element in elements:
+                if element.text in new_urls_map:
+                    parent = None
+                    for potential_parent in root.iter():
+                        if element in list(potential_parent):
+                            parent = potential_parent
+                            break
+
+                    if parent is not None:
+                        new_element = ET.Element(new_node_name)
+                        new_element.text = new_urls_map[element.text]
+
+                        parent_index = list(parent).index(element)
+                        parent.insert(parent_index + 1, new_element)
+
+            return ET.tostring(root, encoding='unicode'), None
 
     except Exception as e:
         return None, f"Błąd podczas aktualizacji XML: {str(e)}"
@@ -394,6 +474,11 @@ def main():
             file_type = st.session_state.file_info["type"]
             file_content = st.session_state.file_info["content"]
 
+            # Debugowanie - pokaż pierwsze 100 znaków XML
+            if file_type == "xml":
+                st.write("Pierwsze 100 znaków pliku XML:", file_content[:100])
+                st.write("Długość zawartości XML:", len(file_content))
+
             if file_type == "xml" and xpath:
                 urls, error = extract_image_urls_from_xml(file_content, xpath, separator)
             elif file_type == "csv" and column_name:
@@ -406,6 +491,8 @@ def main():
             elif not urls:
                 st.warning("Nie znaleziono żadnych URL-i zdjęć.")
             else:
+                st.write(f"Znaleziono {len(urls)} URL-i zdjęć")
+
                 if not st.session_state.ftp_settings["host"] or not st.session_state.ftp_settings["username"]:
                     st.error("Podaj dane serwera FTP.")
                 else:
