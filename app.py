@@ -225,41 +225,11 @@ def extract_image_urls_from_xml(xml_content, xpath, separator=","):
         if xml_content.startswith("\ufeff"):
             xml_content = xml_content[1:]
 
-        # Użyj biblioteki lxml zamiast ElementTree, jeśli jest dostępna
+        # Bezpośrednia obsługa za pomocą ElementTree
         try:
-            from lxml import etree
-            parser = etree.XMLParser(recover=True)
-            root = etree.fromstring(xml_content.encode('utf-8'), parser)
-
-            # Konwersja XPath do formatu lxml
-            namespaces = {}
-            elements = root.xpath(xpath, namespaces=namespaces)
-
-            urls = []
-            for element in elements:
-                element_text = element.text
-                if element_text:
-                    if separator in element_text:
-                        for url in element_text.split(separator):
-                            url = url.strip()
-                            if url:
-                                urls.append(url)
-                    else:
-                        urls.append(element_text.strip())
-
-            return urls, None
-        except ImportError:
-            # Fallback do ElementTree
-            try:
-                root = ET.fromstring(xml_content)
-            except ET.ParseError:
-                # Jeśli parsowanie nie powiodło się, spróbuj usunąć problematyczne znaki
-                xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
-                try:
-                    root = ET.fromstring(xml_content)
-                except ET.ParseError as e:
-                    return None, f"Błąd podczas parsowania XML: {str(e)}"
-
+            # Czyścimy problematyczne znaki
+            xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
+            root = ET.fromstring(xml_content)
             urls = []
             elements = root.findall(xpath)
 
@@ -275,9 +245,106 @@ def extract_image_urls_from_xml(xml_content, xpath, separator=","):
                         urls.append(element_text.strip())
 
             return urls, None
+        except ET.ParseError as e:
+            # Próba alternatywnego parsowania
+            try:
+                # Spróbujmy z minidom
+                import xml.dom.minidom as minidom
+                dom = minidom.parseString(xml_content)
+
+                # Ręczne wyszukiwanie elementów przy użyciu xpath-podobnego podejścia
+                # Przykład: dla xpath "//product/image" szukamy wszystkich elementów "image" wewnątrz "product"
+                parts = xpath.strip().split('/')
+                if parts[0] == '':
+                    parts = parts[1:]  # Usuń pusty element na początku
+                if parts[0] == '':
+                    parts = parts[1:]  # Znowu, dla ścieżek rozpoczynających się od //
+
+                urls = []
+
+                if len(parts) == 2 and parts[0] == 'product' and parts[1] == 'image':
+                    products = dom.getElementsByTagName('product')
+                    for product in products:
+                        images = product.getElementsByTagName('image')
+                        for image in images:
+                            if image.firstChild and image.firstChild.nodeValue:
+                                element_text = image.firstChild.nodeValue
+                                if separator in element_text:
+                                    for url in element_text.split(separator):
+                                        url = url.strip()
+                                        if url:
+                                            urls.append(url)
+                                else:
+                                    urls.append(element_text.strip())
+
+                return urls, None
+            except Exception as inner_e:
+                return None, f"Błąd podczas parsowania XML: {str(e)}. Dodatkowy błąd: {str(inner_e)}"
 
     except Exception as e:
         return None, f"Nieoczekiwany błąd: {str(e)}"
+
+def update_xml_with_new_urls(xml_content, xpath, new_urls_map, new_node_name):
+    try:
+        # Usuń BOM, jeśli istnieje
+        if xml_content.startswith("\ufeff"):
+            xml_content = xml_content[1:]
+
+        # Czyścimy problematyczne znaki
+        xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
+
+        # Parsowanie XML
+        root = ET.fromstring(xml_content)
+        elements = root.findall(xpath)
+
+        for element in elements:
+            if element.text in new_urls_map:
+                parent = None
+                for potential_parent in root.iter():
+                    if element in list(potential_parent):
+                        parent = potential_parent
+                        break
+
+                if parent is not None:
+                    new_element = ET.Element(new_node_name)
+                    new_element.text = new_urls_map[element.text]
+
+                    parent_index = list(parent).index(element)
+                    parent.insert(parent_index + 1, new_element)
+
+        return ET.tostring(root, encoding='unicode'), None
+    except Exception as e:
+        # Alternatywne podejście z minidom
+        try:
+            import xml.dom.minidom as minidom
+            dom = minidom.parseString(xml_content)
+
+            # Ręczne wyszukiwanie elementów przy użyciu xpath-podobnego podejścia
+            parts = xpath.strip().split('/')
+            if parts[0] == '':
+                parts = parts[1:]  # Usuń pusty element na początku
+            if parts[0] == '':
+                parts = parts[1:]  # Znowu, dla ścieżek rozpoczynających się od //
+
+            if len(parts) == 2 and parts[0] == 'product' and parts[1] == 'image':
+                products = dom.getElementsByTagName('product')
+                for product in products:
+                    images = product.getElementsByTagName('image')
+                    for image in images:
+                        if image.firstChild and image.firstChild.nodeValue:
+                            original_url = image.firstChild.nodeValue
+                            if original_url in new_urls_map:
+                                # Utwórz nowy element
+                                new_element = dom.createElement(new_node_name)
+                                new_text = dom.createTextNode(new_urls_map[original_url])
+                                new_element.appendChild(new_text)
+
+                                # Wstaw po elemencie image
+                                product.insertBefore(new_element, image.nextSibling)
+
+            return dom.toxml(), None
+        except Exception as inner_e:
+            return None, f"Błąd podczas aktualizacji XML: {str(e)}. Dodatkowy błąd: {str(inner_e)}"
 
 def extract_image_urls_from_csv(csv_content, column_name, separator=","):
     try:
@@ -302,61 +369,6 @@ def extract_image_urls_from_csv(csv_content, column_name, separator=","):
 
     except Exception as e:
         return None, f"Błąd podczas parsowania CSV: {str(e)}"
-
-def update_xml_with_new_urls(xml_content, xpath, new_urls_map, new_node_name):
-    try:
-        # Usuń BOM, jeśli istnieje
-        if xml_content.startswith("\ufeff"):
-            xml_content = xml_content[1:]
-
-        # Próba użycia lxml do aktualizacji XML
-        try:
-            from lxml import etree
-            parser = etree.XMLParser(recover=True)
-            root = etree.fromstring(xml_content.encode('utf-8'), parser)
-
-            # Konwersja XPath do formatu lxml
-            namespaces = {}
-            elements = root.xpath(xpath, namespaces=namespaces)
-
-            for element in elements:
-                if element.text in new_urls_map:
-                    parent = element.getparent()
-                    if parent is not None:
-                        new_element = etree.Element(new_node_name)
-                        new_element.text = new_urls_map[element.text]
-
-                        # Wstaw nowy element po oryginalnym
-                        parent_index = parent.index(element)
-                        parent.insert(parent_index + 1, new_element)
-
-            # Konwersja z powrotem do stringa
-            return etree.tostring(root, encoding='unicode', pretty_print=True), None
-        except ImportError:
-            # Fallback do ElementTree
-            root = ET.fromstring(xml_content)
-
-            elements = root.findall(xpath)
-
-            for element in elements:
-                if element.text in new_urls_map:
-                    parent = None
-                    for potential_parent in root.iter():
-                        if element in list(potential_parent):
-                            parent = potential_parent
-                            break
-
-                    if parent is not None:
-                        new_element = ET.Element(new_node_name)
-                        new_element.text = new_urls_map[element.text]
-
-                        parent_index = list(parent).index(element)
-                        parent.insert(parent_index + 1, new_element)
-
-            return ET.tostring(root, encoding='unicode'), None
-
-    except Exception as e:
-        return None, f"Błąd podczas aktualizacji XML: {str(e)}"
 
 def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_name):
     try:
