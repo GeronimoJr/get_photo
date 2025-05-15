@@ -2,4 +2,4 @@ streamlit
 requests
 pandas
 lxml
-
+beautifulsoup4
