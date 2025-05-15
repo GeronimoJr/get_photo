@@ -133,27 +133,41 @@ def download_image(url, temp_dir):
         if not parsed_url.scheme or not parsed_url.netloc:
             return None, f"Nieprawidłowy URL: {url}"
 
+        # Ustawienie nagłówków HTTP
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/91.0.4472.124 Safari/537.36"
+            ),
+            "Accept": (
+                "image/avif,image/webp,image/apng,image/svg+xml,"
+                "image/*,*/*;q=0.8"
+            ),
             "Accept-Language": "pl,en-US;q=0.9,en;q=0.8",
             "Referer": f"{parsed_url.scheme}://{parsed_url.netloc}/",
         }
 
-        # Ustawienie specjalnego referera dla RM Gastro
+        # Specjalna obsługa dla api.rmgastro.com
         if "api.rmgastro.com" in url:
             headers["Referer"] = "https://api.rmgastro.com/"
 
-        response = requests.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True)
+        # Użycie sesji requests
+        session = requests.Session()
+        response = session.get(
+            url, stream=True, timeout=30, headers=headers, allow_redirects=True
+        )
         response.raise_for_status()
 
         content_type = response.headers.get("Content-Type", "")
         if not content_type.startswith("image/"):
-            return None, f"URL {url} nie prowadzi do obrazu (Content-Type: {content_type})"
+            return None, (
+                f"URL {url} nie prowadzi do obrazu "
+                f"(Content-Type: {content_type})"
+            )
 
-        # Spróbuj pobrać nazwę pliku
+        # Określenie nazwy pliku
         filename = None
-
         if "Content-Disposition" in response.headers:
             content_disp = response.headers["Content-Disposition"]
             match = re.search(r'filename="?([^"]+)"?', content_disp)
@@ -164,7 +178,6 @@ def download_image(url, temp_dir):
             path = parsed_url.path
             filename = os.path.basename(path) if path else ""
 
-        # Jeśli nadal brak nazwy, generuj z query params lub UUID
         if not filename:
             query = parse_qs(parsed_url.query)
             if "art_id" in query and "artv_id" in query:
@@ -176,7 +189,7 @@ def download_image(url, temp_dir):
             else:
                 filename = f"image_{uuid.uuid4().hex}"
 
-        # Dodaj rozszerzenie jeśli brak
+        # Dodanie rozszerzenia pliku na podstawie Content-Type
         if not os.path.splitext(filename)[1]:
             if "jpeg" in content_type or "jpg" in content_type:
                 filename += ".jpg"
@@ -189,14 +202,18 @@ def download_image(url, temp_dir):
             else:
                 filename += ".jpg"
 
-        # Zapisz plik
+        # Zapisanie pliku
         file_path = os.path.join(temp_dir, filename)
         with open(file_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
 
         if os.path.exists(file_path) and os.path.getsize(file_path) > 100:
-            return {"path": file_path, "filename": filename, "original_url": url}, None
+            return {
+                "path": file_path,
+                "filename": filename,
+                "original_url": url,
+            }, None
         else:
             return None, f"Pobrano pusty lub niepełny plik z URL: {url}"
 
