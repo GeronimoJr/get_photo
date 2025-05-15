@@ -133,106 +133,51 @@ def download_image(url, temp_dir):
         if not parsed_url.scheme or not parsed_url.netloc:
             return None, f"Nieprawidłowy URL: {url}"
 
-        # Ustawienie odpowiednich nagłówków, które naśladują przeglądarkę
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             "Accept-Language": "pl,en-US;q=0.9,en;q=0.8",
             "Referer": f"{parsed_url.scheme}://{parsed_url.netloc}/",
-            "sec-ch-ua": '"Google Chrome";v="91", " Not;A Brand";v="99", "Chromium";v="91"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-fetch-dest": "image",
-            "sec-fetch-mode": "no-cors",
-            "sec-fetch-site": "same-origin",
         }
 
-        # Specjalna obsługa dla api.rmgastro.com
-        if "api.rmgastro.com/image_show.php" in url:
-            query_params = parse_qs(parsed_url.query)
-            art_id = query_params.get("art_id", [""])[0]
-            artv_id = query_params.get("artv_id", [""])[0]
-
-            # Utwórz nazwę pliku na podstawie parametrów
-            filename = f"image_{art_id}_{artv_id}.jpg"
-
-            # Dodaj specjalny nagłówek referer dla tego konkretnego serwisu
+        # Ustawienie specjalnego referera dla RM Gastro
+        if "api.rmgastro.com" in url:
             headers["Referer"] = "https://api.rmgastro.com/"
 
-            # Spróbuj pobrać obraz bezpośrednio z oryginalnego URL
-            session = requests.Session()
-            response = session.get(url, stream=True, timeout=30, headers=headers)
-
-            # Sprawdź, czy odpowiedź zawiera obraz
-            if response.status_code == 200:
-                content_type = response.headers.get("Content-Type", "")
-                if content_type.startswith(("image/", "application/octet-stream")):
-                    file_path = os.path.join(temp_dir, filename)
-
-                    with open(file_path, "wb") as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-
-                    if (
-                        os.path.exists(file_path) and os.path.getsize(file_path) > 100
-                    ):  # Minimalna wielkość obrazu
-                        return {
-                            "path": file_path,
-                            "filename": filename,
-                            "original_url": url,
-                        }, None
-
-            # Jeśli nie udało się pobrać obrazu, wyświetl komunikat błędu
-            return None, f"Nie udało się pobrać obrazu z URL: {url}"
-
-        # Standardowa obsługa dla innych URL-i
-        response = requests.get(
-            url, stream=True, timeout=30, headers=headers, allow_redirects=True
-        )
+        response = requests.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True)
         response.raise_for_status()
 
         content_type = response.headers.get("Content-Type", "")
-        if not content_type.startswith(("image/", "application/octet-stream")):
-            return (
-                None,
-                f"URL {url} nie prowadzi do obrazu (Content-Type: {content_type})",
-            )
+        if not content_type.startswith("image/"):
+            return None, f"URL {url} nie prowadzi do obrazu (Content-Type: {content_type})"
 
-        # Określenie nazwy pliku
+        # Spróbuj pobrać nazwę pliku
         filename = None
 
-        # 1. Spróbuj pobrać nazwę z nagłówka Content-Disposition
         if "Content-Disposition" in response.headers:
             content_disp = response.headers["Content-Disposition"]
-            filename_match = re.search(r'filename="?([^"]+)"?', content_disp)
-            if filename_match:
-                filename = filename_match.group(1)
+            match = re.search(r'filename="?([^"]+)"?', content_disp)
+            if match:
+                filename = match.group(1)
 
-        # 2. Jeśli nie znaleziono, spróbuj pobrać z ścieżki URL
         if not filename:
             path = parsed_url.path
-            if path and path != "/" and os.path.basename(path):
-                filename = os.path.basename(path)
+            filename = os.path.basename(path) if path else ""
 
-        # 3. Jeśli nadal nie mamy nazwy, generuj unikalną nazwę z parametrów URL lub UUID
+        # Jeśli nadal brak nazwy, generuj z query params lub UUID
         if not filename:
-            query_params = parse_qs(parsed_url.query)
-            if "art_id" in query_params and "artv_id" in query_params:
-                art_id = query_params["art_id"][0]
-                artv_id = query_params["artv_id"][0]
-                filename = f"image_{art_id}_{artv_id}.jpg"
-            elif "art_id" in query_params:
-                art_id = query_params["art_id"][0]
-                filename = f"image_{art_id}.jpg"
-            elif "artv_id" in query_params:
-                artv_id = query_params["artv_id"][0]
-                filename = f"image_{artv_id}.jpg"
+            query = parse_qs(parsed_url.query)
+            if "art_id" in query and "artv_id" in query:
+                filename = f"image_{query['art_id'][0]}_{query['artv_id'][0]}"
+            elif "artv_id" in query:
+                filename = f"image_{query['artv_id'][0]}"
+            elif "art_id" in query:
+                filename = f"image_{query['art_id'][0]}"
             else:
-                # Ostateczność - wygeneruj unikalny identyfikator
-                filename = f"image_{uuid.uuid4().hex}.jpg"
+                filename = f"image_{uuid.uuid4().hex}"
 
-        # Sprawdź, czy nazwa pliku ma rozszerzenie
+        # Dodaj rozszerzenie jeśli brak
         if not os.path.splitext(filename)[1]:
-            # Dodaj rozszerzenie na podstawie typu MIME
             if "jpeg" in content_type or "jpg" in content_type:
                 filename += ".jpg"
             elif "png" in content_type:
@@ -242,7 +187,6 @@ def download_image(url, temp_dir):
             elif "webp" in content_type:
                 filename += ".webp"
             else:
-                # Domyślnie użyj JPG
                 filename += ".jpg"
 
         # Zapisz plik
@@ -251,18 +195,16 @@ def download_image(url, temp_dir):
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
 
-        # Sprawdź, czy plik został zapisany i ma rozmiar większy niż 0
-        if (
-            os.path.exists(file_path) and os.path.getsize(file_path) > 100
-        ):  # Minimalna wielkość obrazu
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 100:
             return {"path": file_path, "filename": filename, "original_url": url}, None
         else:
-            return None, f"Pobrano pusty plik dla URL: {url}"
+            return None, f"Pobrano pusty lub niepełny plik z URL: {url}"
 
     except requests.exceptions.RequestException as e:
         return None, f"Błąd podczas pobierania obrazu {url}: {str(e)}"
     except Exception as e:
         return None, f"Nieoczekiwany błąd: {str(e)}"
+
 
 def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
     try:
