@@ -228,118 +228,57 @@ def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
         # Czyścimy problematyczne znaki
         xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
 
+        # Bezpośrednie parsowanie za pomocą wyrażeń regularnych dla konkretnego przypadku
+        if xpath_expression == "//product/image" or xpath_expression == "product/image":
+            try:
+                # Szukamy wszystkich tagów <image> w kontekście <product>
+                # Używamy wyrażenia regularnego, które obsługuje znaki nowej linii i spacje
+                pattern = re.compile(r'<image>(.*?)</image>', re.DOTALL)
+                matches = pattern.findall(xml_content)
+
+                urls = []
+                for match in matches:
+                    match = match.strip()
+                    # Sprawdzamy czy URL jest prawidłowy - musi zawierać http:// lub https://
+                    if match and ('http://' in match or 'https://' in match):
+                        # Obsługa specjalnych znaków HTML jak &amp;
+                        match = match.replace('&amp;', '&')
+                        urls.append(match)
+
+                return urls, None
+            except Exception as e:
+                return None, f"Błąd podczas parsowania XML z wyrażeniami regularnymi: {str(e)}"
+
+        # Standardowe parsowanie dla innych przypadków
         try:
-            # Parsuj XML
             root = ET.fromstring(xml_content)
 
-            # Konwertuj XPath na coś, co ElementTree może obsłużyć
-            # Najprostszy przypadek: //product/image
+            # Uproszczona obsługa XPath
             if xpath_expression.startswith('//'):
-                xpath_expression = xpath_expression[2:] # Usuń początkowe //
+                xpath_expression = f"./{xpath_expression[2:]}"
+            elif not xpath_expression.startswith('./'):
+                xpath_expression = f"./{xpath_expression}"
 
-            # Podziel ścieżkę na części
-            parts = xpath_expression.split('/')
-
-            # Znajdź wszystkie elementy o nazwie takiej jak ostatnia część ścieżki
-            target_elements = root.findall(f'.//{parts[-1]}')
-
-            # Filtruj elementy, które pasują do pełnej ścieżki
-            filtered_elements = []
-            for element in target_elements:
-                # Sprawdź, czy element jest na właściwej ścieżce
-                parent = element
-                path_parts = list(parts)
-                path_parts.reverse()
-                path_parts.pop(0)  # Usuń nazwę elementu docelowego
-
-                is_matching = True
-                for part in path_parts:
-                    parent = parent.getparent() if hasattr(parent, 'getparent') else None
-                    if parent is None or parent.tag != part:
-                        is_matching = False
-                        break
-
-                if is_matching:
-                    filtered_elements.append(element)
-
-            # Jeśli nie znaleziono elementów z pełną ścieżką, użyj wszystkich pasujących elementów
-            elements = filtered_elements if filtered_elements else target_elements
+            elements = root.findall(xpath_expression)
 
             urls = []
             for element in elements:
                 element_text = element.text
                 if element_text:
-                    if separator in element_text:
-                        for url in element_text.split(separator):
-                            url = url.strip()
-                            if url:
-                                urls.append(url)
-                    else:
-                        urls.append(element_text.strip())
-
-            return urls, None
-
-        except ET.ParseError:
-            # Alternatywne parsowanie z użyciem minidom
-            import xml.dom.minidom as minidom
-
-            try:
-                dom = minidom.parseString(xml_content)
-
-                # Podziel ścieżkę na części
-                if xpath_expression.startswith('//'):
-                    xpath_expression = xpath_expression[2:] # Usuń początkowe //
-                parts = xpath_expression.split('/')
-
-                # Znajdź wszystkie elementy o nazwie takiej jak ostatnia część ścieżki
-                elements = dom.getElementsByTagName(parts[-1])
-
-                urls = []
-                for element in elements:
-                    # Sprawdź, czy element jest na właściwej ścieżce
-                    if len(parts) > 1:
-                        parent = element.parentNode
-                        if parent.nodeName != parts[-2]:
-                            continue
-
-                    if element.firstChild and element.firstChild.nodeValue:
-                        element_text = element.firstChild.nodeValue
+                    # Obsługa specjalnych znaków HTML jak &amp;
+                    element_text = element_text.replace('&amp;', '&')
+                    if 'http://' in element_text or 'https://' in element_text:
                         if separator in element_text:
                             for url in element_text.split(separator):
                                 url = url.strip()
-                                if url:
+                                if url and ('http://' in url or 'https://' in url):
                                     urls.append(url)
                         else:
                             urls.append(element_text.strip())
 
-                return urls, None
-
-            except Exception as mini_e:
-                # Ostateczna próba - ręczne parsowanie
-                try:
-                    # Prosta implementacja dla //product/image
-                    if xpath_expression == "//product/image" or xpath_expression == "product/image":
-                        image_pattern = re.compile(r'<image>(.*?)</image>', re.DOTALL)
-                        matches = image_pattern.findall(xml_content)
-
-                        urls = []
-                        for match in matches:
-                            match = match.strip()
-                            if separator in match:
-                                for url in match.split(separator):
-                                    url = url.strip()
-                                    if url:
-                                        urls.append(url)
-                            else:
-                                if match:
-                                    urls.append(match)
-
-                        return urls, None
-                    else:
-                        return None, f"Nieobsługiwana ścieżka XPath: {xpath_expression}"
-
-                except Exception as regex_e:
-                    return None, f"Nie udało się sparsować XML. Błąd: {str(regex_e)}"
+            return urls, None
+        except ET.ParseError as e:
+            return None, f"Błąd podczas parsowania XML z ElementTree: {str(e)}"
 
     except Exception as e:
         return None, f"Nieoczekiwany błąd: {str(e)}"
@@ -356,59 +295,61 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
         # Czyścimy problematyczne znaki
         xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
 
-        # Ręczne parsowanie i aktualizacja XML dla //product/image
+        # Bezpośrednie parsowanie za pomocą wyrażeń regularnych dla konkretnego przypadku
         if xpath_expression == "//product/image" or xpath_expression == "product/image":
             try:
-                # Użyj minidom do parsowania i aktualizacji
-                import xml.dom.minidom as minidom
-                dom = minidom.parseString(xml_content)
+                # Tworzymy kopię zawartości XML do modyfikacji
+                updated_xml = xml_content
 
-                # Znajdź wszystkie elementy image wewnątrz product
-                products = dom.getElementsByTagName('product')
-                for product in products:
-                    images = product.getElementsByTagName('image')
-                    for image in images:
-                        if image.firstChild and image.firstChild.nodeValue:
-                            original_url = image.firstChild.nodeValue.strip()
-                            if original_url in new_urls_map:
-                                # Utwórz nowy element
-                                new_element = dom.createElement(new_node_name)
-                                new_text = dom.createTextNode(new_urls_map[original_url])
-                                new_element.appendChild(new_text)
+                # Dla każdego URL w mapie, znajdujemy odpowiedni tag <image> i dodajemy po nim nowy tag
+                for original_url, new_url in new_urls_map.items():
+                    # Escapujemy znaki specjalne w URL
+                    escaped_url = re.escape(original_url)
+                    # Szukamy tagu <image> zawierającego dokładnie ten URL
+                    pattern = f'(<image>{escaped_url}</image>)'
+                    # Tworzymy nowy tag z URL-em FTP
+                    replacement = f'\\1<{new_node_name}>{new_url}</{new_node_name}>'
+                    # Dokonujemy zamiany
+                    updated_xml = re.sub(pattern, replacement, updated_xml)
 
-                                # Wstaw po elemencie image
-                                if image.nextSibling:
-                                    product.insertBefore(new_element, image.nextSibling)
-                                else:
-                                    product.appendChild(new_element)
+                return updated_xml, None
+            except Exception as e:
+                return None, f"Błąd podczas aktualizacji XML z wyrażeniami regularnymi: {str(e)}"
 
-                return dom.toxml(), None
+        # Standardowe parsowanie dla innych przypadków
+        try:
+            root = ET.fromstring(xml_content)
 
-            except Exception as dom_e:
-                # Jeśli minidom zawiedzie, użyj wyrażeń regularnych
-                try:
-                    # Znajdź wszystkie tagi image wewnątrz product
-                    pattern = re.compile(r'(<product>.*?<image>(.*?)</image>)(.*?</product>)', re.DOTALL)
+            # Uproszczona obsługa XPath
+            if xpath_expression.startswith('//'):
+                xpath_expression = f"./{xpath_expression[2:]}"
+            elif not xpath_expression.startswith('./'):
+                xpath_expression = f"./{xpath_expression}"
 
-                    def replace_func(match):
-                        before_image = match.group(1)
-                        image_content = match.group(2).strip()
-                        after_image = match.group(3)
+            elements = root.findall(xpath_expression)
 
-                        if image_content in new_urls_map:
-                            # Wstaw nowy element po image
-                            new_element = f"<{new_node_name}>{new_urls_map[image_content]}</{new_node_name}>"
-                            return f"{before_image}{after_image[:1]}{new_element}{after_image[1:]}"
-                        else:
-                            return match.group(0)
+            for element in elements:
+                element_text = element.text
+                if element_text and element_text.strip() in new_urls_map:
+                    # Znajdź rodzica elementu
+                    parent = None
+                    for potential_parent in root.iter():
+                        if element in list(potential_parent):
+                            parent = potential_parent
+                            break
 
-                    updated_xml = re.sub(pattern, replace_func, xml_content)
-                    return updated_xml, None
+                    if parent is not None:
+                        # Utwórz nowy element
+                        new_element = ET.Element(new_node_name)
+                        new_element.text = new_urls_map[element_text.strip()]
 
-                except Exception as regex_e:
-                    return None, f"Nie udało się zaktualizować XML. Błąd: {str(regex_e)}"
-        else:
-            return None, f"Nieobsługiwana ścieżka XPath: {xpath_expression}"
+                        # Wstaw nowy element po elemencie oryginalnym
+                        parent_index = list(parent).index(element)
+                        parent.insert(parent_index + 1, new_element)
+
+            return ET.tostring(root, encoding='unicode'), None
+        except ET.ParseError as e:
+            return None, f"Błąd podczas aktualizacji XML z ElementTree: {str(e)}"
 
     except Exception as e:
         return None, f"Nieoczekiwany błąd: {str(e)}"
@@ -553,11 +494,6 @@ def main():
             file_type = st.session_state.file_info["type"]
             file_content = st.session_state.file_info["content"]
 
-            # Debugowanie - pokaż pierwsze 100 znaków XML
-            if file_type == "xml":
-                st.write("Pierwsze 100 znaków pliku XML:", file_content[:100])
-                st.write("Długość zawartości XML:", len(file_content))
-
             if file_type == "xml" and xpath:
                 urls, error = extract_image_urls_from_xml(file_content, xpath, separator)
             elif file_type == "csv" and column_name:
@@ -570,7 +506,7 @@ def main():
             elif not urls:
                 st.warning("Nie znaleziono żadnych URL-i zdjęć.")
             else:
-                st.write(f"Znaleziono {len(urls)} URL-i zdjęć")
+                st.success(f"Znaleziono {len(urls)} URL-i zdjęć")
 
                 if not st.session_state.ftp_settings["host"] or not st.session_state.ftp_settings["username"]:
                     st.error("Podaj dane serwera FTP.")
@@ -652,16 +588,8 @@ def main():
                                     mime="text/plain"
                                 )
 
-        if st.session_state.downloaded_images:
-            st.subheader("Pobrane i przesłane zdjęcia")
-
-            for i, image in enumerate(st.session_state.downloaded_images):
-                st.markdown(f"**{i+1}. {image['filename']}**")
-                st.markdown(f"- Oryginalny URL: {image['original_url']}")
-                st.markdown(f"- FTP URL: {image['ftp_url']}")
-
-            if st.button("Rozpocznij nową operację"):
-                reset_app_state()
+                        if st.button("Rozpocznij nową operację"):
+                            reset_app_state()
 
     with tab2:
         st.markdown("""
