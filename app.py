@@ -14,10 +14,7 @@ from urllib.parse import urlparse
 import shutil
 import uuid
 
-# --- Funkcje pomocnicze ---
-
 def authenticate_user():
-    """Uwierzytelnianie użytkownika"""
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
 
@@ -34,9 +31,7 @@ def authenticate_user():
         st.stop()
     return True
 
-
 def initialize_session_state():
-    """Inicjalizacja zmiennych sesji"""
     if "generated_code" not in st.session_state:
         st.session_state.generated_code = ""
     if "edited_code" not in st.session_state:
@@ -64,9 +59,7 @@ def initialize_session_state():
             "directory": "/"
         }
 
-
 def read_file_content(uploaded_file):
-    """Czyta zawartość pliku z obsługą różnych kodowań"""
     if not uploaded_file:
         return None, "Nie wybrano pliku"
 
@@ -77,15 +70,21 @@ def read_file_content(uploaded_file):
         if file_type not in ["xml", "csv"]:
             return None, "Nieobsługiwany typ pliku. Akceptowane formaty to XML i CSV."
 
-        # Autodetekcja kodowania dla XML
         if file_type == "xml":
             encoding_declared = re.search(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', raw_bytes)
             encodings_to_try = [encoding_declared.group(1).decode('ascii')] if encoding_declared else []
+
+            if encodings_to_try and encodings_to_try[0].lower() == 'utf-16':
+                try:
+                    file_contents = raw_bytes.decode('utf-16')
+                    return {"content": file_contents, "raw_bytes": raw_bytes, 
+                            "type": file_type, "encoding": 'utf-16', "name": uploaded_file.name}, None
+                except UnicodeDecodeError:
+                    pass
         else:
             encodings_to_try = []
 
-        # Lista kodowań do próbowania
-        encodings_to_try += ["utf-8", "iso-8859-2", "windows-1250", "utf-16"]
+        encodings_to_try += ["utf-8", "iso-8859-2", "windows-1250", "utf-16", "utf-16le", "utf-16be"]
 
         for enc in encodings_to_try:
             try:
@@ -95,7 +94,6 @@ def read_file_content(uploaded_file):
             except UnicodeDecodeError:
                 continue
 
-        # Jeśli żadne kodowanie nie działa, spróbuj wczytać jako binarny
         if file_type == "csv":
             try:
                 buffer = io.BytesIO(raw_bytes)
@@ -112,20 +110,15 @@ def read_file_content(uploaded_file):
     except Exception as e:
         return None, f"Błąd podczas odczytu pliku: {str(e)}"
 
-
 def download_image(url, temp_dir):
-    """Pobiera obraz z URL i zapisuje go w katalogu tymczasowym"""
     try:
-        # Sprawdź czy URL jest poprawny
         parsed_url = urlparse(url)
         if not parsed_url.scheme or not parsed_url.netloc:
             return None, f"Nieprawidłowy URL: {url}"
 
-        # Pobierz obraz
         response = requests.get(url, stream=True, timeout=30)
         response.raise_for_status()
 
-        # Określ nazwę pliku
         if "Content-Disposition" in response.headers:
             content_disp = response.headers["Content-Disposition"]
             filename_match = re.search(r'filename="?([^"]+)"?', content_disp)
@@ -136,7 +129,6 @@ def download_image(url, temp_dir):
         else:
             filename = os.path.basename(parsed_url.path) or f"image_{uuid.uuid4().hex}"
 
-        # Dodaj rozszerzenie, jeśli go nie ma
         if not os.path.splitext(filename)[1]:
             content_type = response.headers.get("Content-Type", "")
             if "jpeg" in content_type or "jpg" in content_type:
@@ -148,9 +140,8 @@ def download_image(url, temp_dir):
             elif "webp" in content_type:
                 filename += ".webp"
             else:
-                filename += ".jpg"  # Domyślne rozszerzenie
+                filename += ".jpg"
 
-        # Zapisz plik
         file_path = os.path.join(temp_dir, filename)
         with open(file_path, 'wb') as f:
             shutil.copyfileobj(response.raw, f)
@@ -162,21 +153,16 @@ def download_image(url, temp_dir):
     except Exception as e:
         return None, f"Nieoczekiwany błąd: {str(e)}"
 
-
 def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
-    """Przesyła plik na serwer FTP"""
     try:
-        # Połącz z serwerem FTP
         ftp = ftplib.FTP()
         ftp.connect(ftp_settings["host"], ftp_settings["port"])
         ftp.login(ftp_settings["username"], ftp_settings["password"])
 
-        # Przejdź do katalogu docelowego
         if ftp_settings["directory"] and ftp_settings["directory"] != "/":
             try:
                 ftp.cwd(ftp_settings["directory"])
             except ftplib.error_perm:
-                # Jeśli katalog nie istnieje, spróbuj go utworzyć
                 dirs = ftp_settings["directory"].strip("/").split("/")
                 for directory in dirs:
                     if directory:
@@ -186,15 +172,12 @@ def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
                             ftp.mkd(directory)
                             ftp.cwd(directory)
 
-        # Określ nazwę pliku na serwerze
         if not remote_filename:
             remote_filename = os.path.basename(file_path)
 
-        # Przesyłanie pliku
         with open(file_path, 'rb') as file:
             ftp.storbinary(f'STOR {remote_filename}', file)
 
-        # Pobierz URL do pliku
         file_url = f"ftp://{ftp_settings['username']}:***@{ftp_settings['host']}"
         if ftp_settings["directory"] and ftp_settings["directory"] != "/":
             file_url += f"{ftp_settings['directory']}"
@@ -202,7 +185,6 @@ def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
             file_url += "/"
         file_url += remote_filename
 
-        # Zamknij połączenie
         ftp.quit()
 
         return {"success": True, "url": file_url, "filename": remote_filename}
@@ -210,20 +192,29 @@ def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-
 def extract_image_urls_from_xml(xml_content, xpath, separator=","):
-    """Wyciąga URL-e obrazów z pliku XML"""
     try:
-        root = ET.fromstring(xml_content)
-        urls = []
+        if not xml_content or not xml_content.strip():
+            return None, "Plik XML jest pusty"
 
-        # Znajdź wszystkie elementy pasujące do XPath
+        if xml_content.startswith("\ufeff"):
+            xml_content = xml_content[1:]
+
+        try:
+            root = ET.fromstring(xml_content)
+        except ET.ParseError as e:
+            try:
+                xml_bytes = xml_content.encode("utf-8")
+                root = ET.fromstring(xml_bytes)
+            except Exception as inner_e:
+                return None, f"Błąd podczas parsowania XML: {str(e)}. Dodatkowy błąd: {str(inner_e)}"
+
+        urls = []
         elements = root.findall(xpath)
 
         for element in elements:
             element_text = element.text
             if element_text:
-                # Podziel tekst, jeśli zawiera separator
                 if separator in element_text:
                     for url in element_text.split(separator):
                         url = url.strip()
@@ -235,11 +226,9 @@ def extract_image_urls_from_xml(xml_content, xpath, separator=","):
         return urls, None
 
     except Exception as e:
-        return None, f"Błąd podczas parsowania XML: {str(e)}"
-
+        return None, f"Nieoczekiwany błąd: {str(e)}"
 
 def extract_image_urls_from_csv(csv_content, column_name, separator=","):
-    """Wyciąga URL-e obrazów z pliku CSV"""
     try:
         df = pd.read_csv(io.StringIO(csv_content))
 
@@ -250,7 +239,6 @@ def extract_image_urls_from_csv(csv_content, column_name, separator=","):
 
         for value in df[column_name]:
             if pd.notna(value):
-                # Podziel tekst, jeśli zawiera separator
                 if separator in str(value):
                     for url in str(value).split(separator):
                         url = url.strip()
@@ -264,18 +252,14 @@ def extract_image_urls_from_csv(csv_content, column_name, separator=","):
     except Exception as e:
         return None, f"Błąd podczas parsowania CSV: {str(e)}"
 
-
 def update_xml_with_new_urls(xml_content, xpath, new_urls_map, new_node_name):
-    """Aktualizuje plik XML, dodając nowe węzły z URL-ami FTP"""
     try:
         root = ET.fromstring(xml_content)
 
-        # Znajdź wszystkie elementy pasujące do XPath
         elements = root.findall(xpath)
 
         for element in elements:
             if element.text in new_urls_map:
-                # Znajdź rodzica elementu
                 parent = None
                 for potential_parent in root.iter():
                     if element in list(potential_parent):
@@ -283,67 +267,49 @@ def update_xml_with_new_urls(xml_content, xpath, new_urls_map, new_node_name):
                         break
 
                 if parent is not None:
-                    # Utwórz nowy element z tym samym tagiem lub określonym tagiem
                     new_element = ET.Element(new_node_name)
                     new_element.text = new_urls_map[element.text]
 
-                    # Dodaj nowy element do tego samego rodzica
                     parent_index = list(parent).index(element)
                     parent.insert(parent_index + 1, new_element)
 
-        # Konwertuj zaktualizowany XML na string
         return ET.tostring(root, encoding='unicode'), None
 
     except Exception as e:
         return None, f"Błąd podczas aktualizacji XML: {str(e)}"
 
-
 def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_name):
-    """Aktualizuje plik CSV, dodając nową kolumnę z URL-ami FTP"""
     try:
         df = pd.read_csv(io.StringIO(csv_content))
 
         if column_name not in df.columns:
             return None, f"Kolumna '{column_name}' nie istnieje w pliku CSV."
 
-        # Utwórz nową kolumnę
         df[new_column_name] = ""
 
-        # Zaktualizuj wartości w nowej kolumnie
         for idx, value in enumerate(df[column_name]):
             if pd.notna(value) and value in new_urls_map:
                 df.at[idx, new_column_name] = new_urls_map[value]
 
-        # Konwertuj zaktualizowany DataFrame na string
         return df.to_csv(index=False), None
 
     except Exception as e:
         return None, f"Błąd podczas aktualizacji CSV: {str(e)}"
 
-
 def reset_app_state():
-    """Resetuje stan aplikacji"""
     for key in list(st.session_state.keys()):
         if key not in ["authenticated", "ftp_settings"]:
             del st.session_state[key]
     initialize_session_state()
     st.rerun()
 
-
 def main():
-    """Główna funkcja aplikacji"""
-    # Ustawienia strony
     st.set_page_config(page_title="Pobieranie zdjęć z XML/CSV", layout="centered")
-    # Uwierzytelnianie
     authenticate_user()
-
-    # Inicjalizacja stanu sesji
     initialize_session_state()
 
-    # Interfejs użytkownika - prosty layout
     st.title("Pobieranie zdjęć z XML/CSV")
 
-    # Zakładki
     tab1, tab2 = st.tabs(["Pobieranie zdjęć", "Pomoc"])
 
     with tab1:
@@ -352,7 +318,6 @@ def main():
         Prześlij plik, wskaż lokalizację linków do zdjęć, podaj dane FTP i pobierz zdjęcia.
         """)
 
-        # Sekcja 1: Wczytywanie pliku
         st.subheader("1. Wczytaj plik źródłowy")
         uploaded_file = st.file_uploader("Wgraj plik XML lub CSV", type=["xml", "csv"])
 
@@ -364,7 +329,6 @@ def main():
                 st.success(f"Wczytano plik: {file_info['name']} ({file_info['type'].upper()}, {file_info['encoding']})")
                 st.session_state.file_info = file_info
 
-        # Sekcja 2: Konfiguracja pobierania
         st.subheader("2. Konfiguracja pobierania zdjęć")
 
         if st.session_state.file_info:
@@ -379,7 +343,7 @@ def main():
                     "Nazwa nowego węzła dla linków FTP", 
                     placeholder="Np. ftp_image"
                 )
-            else:  # csv
+            else:
                 column_name = st.text_input(
                     "Nazwa kolumny zawierającej URL-e zdjęć", 
                     placeholder="Np. image_url"
@@ -394,7 +358,6 @@ def main():
                 value=","
             )
 
-        # Sekcja 3: Konfiguracja FTP
         st.subheader("3. Konfiguracja serwera FTP")
 
         col1, col2 = st.columns(2)
@@ -425,14 +388,12 @@ def main():
                 value=st.session_state.ftp_settings["password"]
             )
 
-        # Sekcja 4: Pobieranie i przesyłanie
         st.subheader("4. Pobierz zdjęcia i prześlij na FTP")
 
         if st.session_state.file_info and st.button("Pobierz zdjęcia i prześlij na FTP"):
             file_type = st.session_state.file_info["type"]
             file_content = st.session_state.file_info["content"]
 
-            # Pobierz URL-e zdjęć
             if file_type == "xml" and xpath:
                 urls, error = extract_image_urls_from_xml(file_content, xpath, separator)
             elif file_type == "csv" and column_name:
@@ -445,43 +406,37 @@ def main():
             elif not urls:
                 st.warning("Nie znaleziono żadnych URL-i zdjęć.")
             else:
-                # Sprawdź konfigurację FTP
                 if not st.session_state.ftp_settings["host"] or not st.session_state.ftp_settings["username"]:
                     st.error("Podaj dane serwera FTP.")
                 else:
-                    # Pobierz i prześlij zdjęcia
                     progress_bar = st.progress(0)
                     status_text = st.empty()
 
                     with tempfile.TemporaryDirectory() as tmpdirname:
                         downloaded_images = []
-                        new_urls_map = {}  # Mapowanie oryginalny URL -> nowy URL FTP
+                        new_urls_map = {}
 
                         for i, url in enumerate(urls):
                             status_text.text(f"Przetwarzanie {i+1}/{len(urls)}: {url}")
                             progress_bar.progress((i) / len(urls))
 
-                            # Pobierz obraz
                             image_info, error = download_image(url, tmpdirname)
                             if error:
                                 st.warning(f"Nie udało się pobrać {url}: {error}")
                                 continue
 
-                            # Prześlij na FTP
                             upload_result = upload_to_ftp(
                                 image_info["path"], 
                                 st.session_state.ftp_settings
                             )
 
                             if upload_result["success"]:
-                                # Dodaj do listy pobranych i przesłanych obrazów
                                 downloaded_images.append({
                                     "original_url": url,
                                     "ftp_url": upload_result["url"],
                                     "filename": upload_result["filename"]
                                 })
 
-                                # Dodaj do mapy URL-i
                                 ftp_url = f"ftp://{st.session_state.ftp_settings['host']}"
                                 if st.session_state.ftp_settings["directory"] and st.session_state.ftp_settings["directory"] != "/":
                                     ftp_url += f"{st.session_state.ftp_settings['directory']}"
@@ -495,10 +450,8 @@ def main():
                         progress_bar.progress(1.0)
                         status_text.text(f"Zakończono przetwarzanie. Pobrano i przesłano {len(downloaded_images)} z {len(urls)} zdjęć.")
 
-                        # Zapisz informacje o pobranych obrazach
                         st.session_state.downloaded_images = downloaded_images
 
-                        # Aktualizuj plik źródłowy o nowe URL-e
                         if new_urls_map:
                             if file_type == "xml":
                                 updated_content, error = update_xml_with_new_urls(
@@ -507,7 +460,7 @@ def main():
                                     new_urls_map, 
                                     new_node_name
                                 )
-                            else:  # csv
+                            else:
                                 updated_content, error = update_csv_with_new_urls(
                                     file_content, 
                                     column_name, 
@@ -518,13 +471,11 @@ def main():
                             if error:
                                 st.error(f"Błąd podczas aktualizacji pliku: {error}")
                             else:
-                                # Zapisz zaktualizowany plik
                                 st.session_state.output_bytes = updated_content.encode(
                                     st.session_state.file_info["encoding"]
                                 )
                                 st.success("Plik został zaktualizowany o nowe linki FTP.")
 
-                                # Przycisk pobierania
                                 original_name = st.session_state.file_info["name"]
                                 base_name = os.path.splitext(original_name)[0]
 
@@ -535,7 +486,6 @@ def main():
                                     mime="text/plain"
                                 )
 
-        # Wyświetl listę pobranych zdjęć
         if st.session_state.downloaded_images:
             st.subheader("Pobrane i przesłane zdjęcia")
 
@@ -544,7 +494,6 @@ def main():
                 st.markdown(f"- Oryginalny URL: {image['original_url']}")
                 st.markdown(f"- FTP URL: {image['ftp_url']}")
 
-            # Przycisk do resetowania stanu aplikacji
             if st.button("Rozpocznij nową operację"):
                 reset_app_state()
 
