@@ -135,48 +135,50 @@ def download_image(url, temp_dir):
             return None, f"Nieprawidłowy URL: {url}"
 
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/91.0.4472.124 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0",
             "Accept": "*/*",
-            "Accept-Language": "pl,en-US;q=0.9,en;q=0.8",
             "Referer": f"{parsed_url.scheme}://{parsed_url.netloc}/",
         }
 
-        # Obsługa RM Gastro - link nie jest obrazem, trzeba wyciągnąć src z <img>
-        if "api.rmgastro.com/image_show.php" in url:
-            session = requests.Session()
-            html_resp = session.get(url, headers=headers, timeout=10)
+        # Obsługa image_show.php z RM Gastro
+        if "image_show.php" in url:
+            html_resp = requests.get(url, headers=headers, timeout=10)
             html_resp.raise_for_status()
 
             soup = BeautifulSoup(html_resp.text, "html.parser")
             img_tag = soup.find("img")
-            if not img_tag or not img_tag.get("src"):
-                return None, "Nie znaleziono znacznika <img> z obrazem"
 
+            if not img_tag or not img_tag.get("src"):
+                return None, "Nie znaleziono znacznika <img> w odpowiedzi HTML"
+
+            # Budujemy pełny URL do obrazka
             img_src = img_tag["src"]
             if not img_src.startswith("http"):
                 img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}"
             else:
                 img_url = img_src
+        else:
+            img_url = url  # standardowy przypadek
 
-            url = img_url  # teraz mamy właściwy link do obrazu
-
-        # teraz już normalne pobieranie obrazka
-        response = requests.get(url, stream=True, timeout=30, headers=headers)
+        # Pobieramy właściwy obraz
+        response = requests.get(img_url, headers=headers, stream=True, timeout=15)
         response.raise_for_status()
 
         content_type = response.headers.get("Content-Type", "")
         if not content_type.startswith("image/"):
             return None, f"Nieprawidłowy Content-Type: {content_type}"
 
-        filename = os.path.basename(urlparse(url).path)
-        if not filename or "." not in filename:
-            filename = f"image_{uuid.uuid4().hex}.jpg"
+        # Nadajemy nazwę pliku
+        extension = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp"
+        }.get(content_type, ".jpg")
 
+        filename = f"image_{uuid.uuid4().hex}{extension}"
         file_path = os.path.join(temp_dir, filename)
+
         with open(file_path, "wb") as f:
             for chunk in response.iter_content(8192):
                 f.write(chunk)
@@ -184,7 +186,7 @@ def download_image(url, temp_dir):
         if os.path.exists(file_path) and os.path.getsize(file_path) > 100:
             return {"path": file_path, "filename": filename, "original_url": url}, None
         else:
-            return None, "Pobrano pusty plik"
+            return None, "Pobrano pusty lub niepełny plik"
 
     except Exception as e:
         return None, f"Błąd: {str(e)}"
