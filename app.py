@@ -71,12 +71,9 @@ def read_file_content(uploaded_file):
         if file_type not in ["xml", "csv"]:
             return None, "Nieobsługiwany typ pliku. Akceptowane formaty to XML i CSV."
 
-        # Specjalna obsługa dla plików XML
         if file_type == "xml":
-            # Sprawdź BOM i kodowanie
             if raw_bytes.startswith(codecs.BOM_UTF16_LE) or raw_bytes.startswith(codecs.BOM_UTF16_BE):
                 try:
-                    # UTF-16 z BOM
                     if raw_bytes.startswith(codecs.BOM_UTF16_LE):
                         file_contents = raw_bytes.decode('utf-16-le')
                     else:
@@ -87,13 +84,11 @@ def read_file_content(uploaded_file):
                 except UnicodeDecodeError:
                     pass
 
-            # Wykryj kodowanie z deklaracji XML
             encoding_declared = re.search(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', raw_bytes)
             if encoding_declared:
                 declared_encoding = encoding_declared.group(1).decode('ascii').lower()
                 try:
                     if declared_encoding.startswith('utf-16'):
-                        # Próbuj obie wersje UTF-16
                         try:
                             file_contents = raw_bytes.decode('utf-16-le')
                         except UnicodeDecodeError:
@@ -106,7 +101,6 @@ def read_file_content(uploaded_file):
                 except (UnicodeDecodeError, LookupError):
                     pass
 
-        # Standardowa obsługa dla wszystkich plików
         encodings_to_try = ["utf-8", "iso-8859-2", "windows-1250", "utf-16-le", "utf-16-be"]
 
         for enc in encodings_to_try:
@@ -117,7 +111,6 @@ def read_file_content(uploaded_file):
             except UnicodeDecodeError:
                 continue
 
-        # Jeśli żadne kodowanie nie działa, spróbuj wczytać jako binarny
         if file_type == "csv":
             try:
                 buffer = io.BytesIO(raw_bytes)
@@ -140,48 +133,81 @@ def download_image(url, temp_dir):
         if not parsed_url.scheme or not parsed_url.netloc:
             return None, f"Nieprawidłowy URL: {url}"
 
-        # Dodaj User-Agent, aby uniknąć blokady przez serwery
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Referer": f"{parsed_url.scheme}://{parsed_url.netloc}/",
         }
 
-        # Pobierz obraz z pełnym śledzeniem przekierowań
-        response = requests.get(url, stream=True, timeout=30, headers=headers, allow_redirects=True)
+        response = requests.get(
+            url, stream=True, timeout=30, headers=headers, allow_redirects=True
+        )
         response.raise_for_status()
 
-        # Określenie nazwy pliku
+        content_type = response.headers.get("Content-Type", "")
+        if not content_type.startswith(("image/", "application/octet-stream")):
+            if "text/html" in content_type:
+                if "api.rmgastro.com/image_show.php" in url:
+                    query_params = parse_qs(parsed_url.query)
+                    art_id = query_params.get("art_id", [""])[0]
+                    artv_id = query_params.get("artv_id", [""])[0]
+
+                    direct_url = f"https://api.rmgastro.com/images/articles/{art_id}/{artv_id}.jpg"
+                    direct_response = requests.get(
+                        direct_url, stream=True, timeout=30, headers=headers
+                    )
+
+                    if (
+                        direct_response.status_code == 200
+                        and direct_response.headers.get("Content-Type", "").startswith(
+                            "image/"
+                        )
+                    ):
+                        response = direct_response
+                    else:
+                        return (
+                            None,
+                            f"URL {url} nie prowadzi do obrazu, a próba bezpośredniego pobrania nie powiodła się",
+                        )
+                else:
+                    return (
+                        None,
+                        f"URL {url} nie prowadzi do obrazu (Content-Type: {content_type})",
+                    )
+
         filename = None
 
-        # 1. Spróbuj pobrać nazwę z nagłówka Content-Disposition
         if "Content-Disposition" in response.headers:
             content_disp = response.headers["Content-Disposition"]
             filename_match = re.search(r'filename="?([^"]+)"?', content_disp)
             if filename_match:
                 filename = filename_match.group(1)
 
-        # 2. Jeśli nie znaleziono, spróbuj pobrać z ścieżki URL
         if not filename:
             path = parsed_url.path
-            if path and path != "/" and os.path.basename(path):
+            if (
+                path
+                and path != "/"
+                and os.path.basename(path)
+                and os.path.basename(path) != "image_show.php"
+            ):
                 filename = os.path.basename(path)
 
-        # 3. Jeśli nadal nie mamy nazwy, generuj unikalną nazwę z parametrów URL lub UUID
         if not filename or filename == "image_show.php":
-            # Sprawdź, czy URL ma parametry (np. art_id)
             query_params = parse_qs(parsed_url.query)
-            if 'art_id' in query_params:
-                art_id = query_params['art_id'][0]
+            if "art_id" in query_params and "artv_id" in query_params:
+                art_id = query_params["art_id"][0]
+                artv_id = query_params["artv_id"][0]
+                filename = f"image_{art_id}_{artv_id}.jpg"
+            elif "art_id" in query_params:
+                art_id = query_params["art_id"][0]
                 filename = f"image_{art_id}.jpg"
-            elif 'artv_id' in query_params:
-                artv_id = query_params['artv_id'][0]
+            elif "artv_id" in query_params:
+                artv_id = query_params["artv_id"][0]
                 filename = f"image_{artv_id}.jpg"
             else:
-                # Ostateczność - wygeneruj unikalny identyfikator
                 filename = f"image_{uuid.uuid4().hex}.jpg"
 
-        # Sprawdź, czy nazwa pliku ma rozszerzenie
         if not os.path.splitext(filename)[1]:
-            # Dodaj rozszerzenie na podstawie typu MIME
             content_type = response.headers.get("Content-Type", "")
             if "jpeg" in content_type or "jpg" in content_type:
                 filename += ".jpg"
@@ -192,16 +218,13 @@ def download_image(url, temp_dir):
             elif "webp" in content_type:
                 filename += ".webp"
             else:
-                # Domyślnie użyj JPG
                 filename += ".jpg"
 
-        # Zapisz plik
         file_path = os.path.join(temp_dir, filename)
-        with open(file_path, 'wb') as f:
+        with open(file_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
 
-        # Sprawdź, czy plik został zapisany i ma rozmiar większy niż 0
         if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
             return {"path": file_path, "filename": filename, "original_url": url}, None
         else:
@@ -214,25 +237,20 @@ def download_image(url, temp_dir):
 
 def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
     try:
-        # Sprawdź, czy plik istnieje
         if not os.path.exists(file_path):
             return {"success": False, "error": f"Plik nie istnieje: {file_path}"}
 
-        # Sprawdź, czy plik ma zawartość
         if os.path.getsize(file_path) == 0:
             return {"success": False, "error": f"Plik jest pusty: {file_path}"}
 
-        # Połącz z serwerem FTP
         ftp = ftplib.FTP()
         ftp.connect(ftp_settings["host"], ftp_settings["port"])
         ftp.login(ftp_settings["username"], ftp_settings["password"])
 
-        # Przejdź do katalogu docelowego
         if ftp_settings["directory"] and ftp_settings["directory"] != "/":
             try:
                 ftp.cwd(ftp_settings["directory"])
             except ftplib.error_perm:
-                # Jeśli katalog nie istnieje, utwórz go
                 dirs = ftp_settings["directory"].strip("/").split("/")
                 for directory in dirs:
                     if directory:
@@ -242,15 +260,12 @@ def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
                             ftp.mkd(directory)
                             ftp.cwd(directory)
 
-        # Określ nazwę pliku na serwerze
         if not remote_filename:
             remote_filename = os.path.basename(file_path)
 
-        # Prześlij plik
         with open(file_path, 'rb') as file:
             ftp.storbinary(f'STOR {remote_filename}', file)
 
-        # Generuj URL do pliku
         ftp_url = f"ftp://{ftp_settings['host']}"
         if ftp_settings["directory"] and ftp_settings["directory"] != "/":
             if not ftp_settings["directory"].startswith("/"):
@@ -262,7 +277,6 @@ def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
             ftp_url += "/"
         ftp_url += remote_filename
 
-        # Zamknij połączenie
         ftp.quit()
 
         return {"success": True, "url": ftp_url, "filename": remote_filename}
@@ -275,27 +289,20 @@ def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
         if not xml_content or not xml_content.strip():
             return None, "Plik XML jest pusty"
 
-        # Usuń BOM, jeśli istnieje
         if xml_content.startswith("\ufeff"):
             xml_content = xml_content[1:]
 
-        # Czyścimy problematyczne znaki
         xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
 
-        # Bezpośrednie parsowanie za pomocą wyrażeń regularnych dla konkretnego przypadku
         if xpath_expression == "//product/image" or xpath_expression == "product/image":
             try:
-                # Szukamy wszystkich tagów <image> w kontekście <product>
-                # Używamy wyrażenia regularnego, które obsługuje znaki nowej linii i spacje
                 pattern = re.compile(r'<image>(.*?)</image>', re.DOTALL)
                 matches = pattern.findall(xml_content)
 
                 urls = []
                 for match in matches:
                     match = match.strip()
-                    # Sprawdzamy czy URL jest prawidłowy - musi zawierać http:// lub https://
                     if match and ('http://' in match or 'https://' in match):
-                        # Obsługa specjalnych znaków HTML jak &amp;
                         match = match.replace('&amp;', '&')
                         urls.append(match)
 
@@ -303,11 +310,9 @@ def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
             except Exception as e:
                 return None, f"Błąd podczas parsowania XML z wyrażeniami regularnymi: {str(e)}"
 
-        # Standardowe parsowanie dla innych przypadków
         try:
             root = ET.fromstring(xml_content)
 
-            # Uproszczona obsługa XPath
             if xpath_expression.startswith('//'):
                 xpath_expression = f"./{xpath_expression[2:]}"
             elif not xpath_expression.startswith('./'):
@@ -319,7 +324,6 @@ def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
             for element in elements:
                 element_text = element.text
                 if element_text:
-                    # Obsługa specjalnych znaków HTML jak &amp;
                     element_text = element_text.replace('&amp;', '&')
                     if 'http://' in element_text or 'https://' in element_text:
                         if separator in element_text:
@@ -342,66 +346,58 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
         if not xml_content or not xml_content.strip():
             return None, "Plik XML jest pusty"
 
-        # Usuń BOM, jeśli istnieje
         if xml_content.startswith("\ufeff"):
             xml_content = xml_content[1:]
 
-        # Czyścimy problematyczne znaki
-        xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
+        xml_content = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", xml_content)
 
-        # Bezpośrednie parsowanie za pomocą wyrażeń regularnych dla konkretnego przypadku
         if xpath_expression == "//product/image" or xpath_expression == "product/image":
             try:
-                # Tworzymy kopię zawartości XML do modyfikacji
                 updated_xml = xml_content
 
-                # Dla każdego URL w mapie, znajdujemy odpowiedni tag <image> i dodajemy po nim nowy tag
                 for original_url, new_url in new_urls_map.items():
-                    # Escapujemy znaki specjalne w URL
                     escaped_url = re.escape(original_url)
-                    # Szukamy tagu <image> zawierającego dokładnie ten URL
-                    pattern = f'(<image>{escaped_url}</image>)'
-                    # Tworzymy nowy tag z URL-em FTP
-                    replacement = f'\\1<{new_node_name}>{new_url}</{new_node_name}>'
-                    # Dokonujemy zamiany
+                    pattern = f"(<image>{escaped_url}</image>)"
+                    replacement = f"\\1\n<{new_node_name}>{new_url}</{new_node_name}>"
                     updated_xml = re.sub(pattern, replacement, updated_xml)
 
                 return updated_xml, None
             except Exception as e:
-                return None, f"Błąd podczas aktualizacji XML z wyrażeniami regularnymi: {str(e)}"
+                return (
+                    None,
+                    f"Błąd podczas aktualizacji XML z wyrażeniami regularnymi: {str(e)}",
+                )
 
-        # Standardowe parsowanie dla innych przypadków
         try:
-            root = ET.fromstring(xml_content)
+            parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+            root = ET.fromstring(xml_content, parser=parser)
 
-            # Uproszczona obsługa XPath
-            if xpath_expression.startswith('//'):
-                xpath_expression = f"./{xpath_expression[2:]}"
-            elif not xpath_expression.startswith('./'):
-                xpath_expression = f"./{xpath_expression}"
+            if xpath_expression.startswith("//"):
+                xpath_parts = xpath_expression[2:].split("/")
+                search_path = ".//" + xpath_parts[-1]
+            elif not xpath_expression.startswith("./"):
+                search_path = f"./{xpath_expression}"
+            else:
+                search_path = xpath_expression
 
-            elements = root.findall(xpath_expression)
+            for element in root.findall(search_path):
+                element_text = element.text.strip() if element.text else ""
 
-            for element in elements:
-                element_text = element.text
-                if element_text and element_text.strip() in new_urls_map:
-                    # Znajdź rodzica elementu
+                if element_text in new_urls_map:
                     parent = None
-                    for potential_parent in root.iter():
-                        if element in list(potential_parent):
-                            parent = potential_parent
+                    for p in root.iter():
+                        if element in list(p):
+                            parent = p
                             break
 
                     if parent is not None:
-                        # Utwórz nowy element
                         new_element = ET.Element(new_node_name)
-                        new_element.text = new_urls_map[element_text.strip()]
+                        new_element.text = new_urls_map[element_text]
 
-                        # Wstaw nowy element po elemencie oryginalnym
-                        parent_index = list(parent).index(element)
-                        parent.insert(parent_index + 1, new_element)
+                        idx = list(parent).index(element)
+                        parent.insert(idx + 1, new_element)
 
-            return ET.tostring(root, encoding='unicode'), None
+            return ET.tostring(root, encoding="unicode", method="xml"), None
         except ET.ParseError as e:
             return None, f"Błąd podczas aktualizacji XML z ElementTree: {str(e)}"
 
@@ -562,7 +558,6 @@ def main():
             else:
                 st.success(f"Znaleziono {len(urls)} URL-i zdjęć")
 
-                # Wyświetl pierwsze 5 URL-i dla debugowania
                 with st.expander("Podgląd znalezionych URL-i"):
                     for i, url in enumerate(urls[:5]):
                         st.write(f"{i+1}. {url}")
@@ -584,7 +579,6 @@ def main():
                             status_text.text(f"Przetwarzanie {i+1}/{len(urls)}: {url}")
                             progress_bar.progress((i) / len(urls))
 
-                            # Pobierz obraz
                             debug_area.info(f"Pobieranie obrazu: {url}")
                             image_info, error = download_image(url, tmpdirname)
 
@@ -594,7 +588,6 @@ def main():
                             else:
                                 debug_area.success(f"Pobrano obraz: {image_info['filename']} ({os.path.getsize(image_info['path'])} bajtów)")
 
-                            # Prześlij na FTP
                             debug_area.info(f"Przesyłanie na FTP: {image_info['filename']}")
                             upload_result = upload_to_ftp(
                                 image_info["path"], 
@@ -610,7 +603,6 @@ def main():
 
                                 debug_area.success(f"Przesłano na FTP: {upload_result['filename']}")
 
-                                # Utwórz URL FTP bez danych logowania do pokazania w XML
                                 ftp_url = f"ftp://{st.session_state.ftp_settings['host']}"
                                 if st.session_state.ftp_settings["directory"] and st.session_state.ftp_settings["directory"] != "/":
                                     if not st.session_state.ftp_settings["directory"].startswith("/"):
