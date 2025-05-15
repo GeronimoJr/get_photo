@@ -133,6 +133,60 @@ def download_image(url, temp_dir):
         if not parsed_url.scheme or not parsed_url.netloc:
             return None, f"Nieprawidłowy URL: {url}"
 
+        # Specjalna obsługa dla api.rmgastro.com
+        if "api.rmgastro.com/image_show.php" in url:
+            query_params = parse_qs(parsed_url.query)
+            art_id = query_params.get("art_id", [""])[0]
+            artv_id = query_params.get("artv_id", [""])[0]
+
+            # Bezpośredni URL do obrazu
+            direct_url = (
+                f"https://api.rmgastro.com/images/articles/{art_id}/{artv_id}.jpg"
+            )
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Referer": "https://api.rmgastro.com/",
+            }
+
+            response = requests.get(
+                direct_url, stream=True, timeout=30, headers=headers
+            )
+
+            if response.status_code != 200:
+                # Spróbuj alternatywny format URL
+                direct_url = f"https://api.rmgastro.com/images/articles/large/{art_id}_{artv_id}.jpg"
+                response = requests.get(
+                    direct_url, stream=True, timeout=30, headers=headers
+                )
+
+            if response.status_code != 200:
+                # Jeszcze jedna próba z innym formatem
+                direct_url = f"https://api.rmgastro.com/images/articles/{artv_id}.jpg"
+                response = requests.get(
+                    direct_url, stream=True, timeout=30, headers=headers
+                )
+
+            if response.status_code != 200:
+                return None, f"Nie udało się pobrać obrazu dla URL: {url}"
+
+            filename = f"image_{art_id}_{artv_id}.jpg"
+            file_path = os.path.join(temp_dir, filename)
+
+            with open(file_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                return {
+                    "path": file_path,
+                    "filename": filename,
+                    "original_url": url,
+                }, None
+            else:
+                return None, f"Pobrano pusty plik dla URL: {url}"
+
+        # Standardowa obsługa dla innych URL-i
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Referer": f"{parsed_url.scheme}://{parsed_url.netloc}/",
@@ -145,34 +199,10 @@ def download_image(url, temp_dir):
 
         content_type = response.headers.get("Content-Type", "")
         if not content_type.startswith(("image/", "application/octet-stream")):
-            if "text/html" in content_type:
-                if "api.rmgastro.com/image_show.php" in url:
-                    query_params = parse_qs(parsed_url.query)
-                    art_id = query_params.get("art_id", [""])[0]
-                    artv_id = query_params.get("artv_id", [""])[0]
-
-                    direct_url = f"https://api.rmgastro.com/images/articles/{art_id}/{artv_id}.jpg"
-                    direct_response = requests.get(
-                        direct_url, stream=True, timeout=30, headers=headers
-                    )
-
-                    if (
-                        direct_response.status_code == 200
-                        and direct_response.headers.get("Content-Type", "").startswith(
-                            "image/"
-                        )
-                    ):
-                        response = direct_response
-                    else:
-                        return (
-                            None,
-                            f"URL {url} nie prowadzi do obrazu, a próba bezpośredniego pobrania nie powiodła się",
-                        )
-                else:
-                    return (
-                        None,
-                        f"URL {url} nie prowadzi do obrazu (Content-Type: {content_type})",
-                    )
+            return (
+                None,
+                f"URL {url} nie prowadzi do obrazu (Content-Type: {content_type})",
+            )
 
         filename = None
 
@@ -184,15 +214,10 @@ def download_image(url, temp_dir):
 
         if not filename:
             path = parsed_url.path
-            if (
-                path
-                and path != "/"
-                and os.path.basename(path)
-                and os.path.basename(path) != "image_show.php"
-            ):
+            if path and path != "/" and os.path.basename(path):
                 filename = os.path.basename(path)
 
-        if not filename or filename == "image_show.php":
+        if not filename:
             query_params = parse_qs(parsed_url.query)
             if "art_id" in query_params and "artv_id" in query_params:
                 art_id = query_params["art_id"][0]
