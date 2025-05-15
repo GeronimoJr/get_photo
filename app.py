@@ -216,7 +216,7 @@ def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def extract_image_urls_from_xml(xml_content, xpath, separator=","):
+def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
     try:
         if not xml_content or not xml_content.strip():
             return None, "Plik XML jest pusty"
@@ -225,14 +225,47 @@ def extract_image_urls_from_xml(xml_content, xpath, separator=","):
         if xml_content.startswith("\ufeff"):
             xml_content = xml_content[1:]
 
-        # Bezpośrednia obsługa za pomocą ElementTree
-        try:
-            # Czyścimy problematyczne znaki
-            xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
-            root = ET.fromstring(xml_content)
-            urls = []
-            elements = root.findall(xpath)
+        # Czyścimy problematyczne znaki
+        xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
 
+        try:
+            # Parsuj XML
+            root = ET.fromstring(xml_content)
+
+            # Konwertuj XPath na coś, co ElementTree może obsłużyć
+            # Najprostszy przypadek: //product/image
+            if xpath_expression.startswith('//'):
+                xpath_expression = xpath_expression[2:] # Usuń początkowe //
+
+            # Podziel ścieżkę na części
+            parts = xpath_expression.split('/')
+
+            # Znajdź wszystkie elementy o nazwie takiej jak ostatnia część ścieżki
+            target_elements = root.findall(f'.//{parts[-1]}')
+
+            # Filtruj elementy, które pasują do pełnej ścieżki
+            filtered_elements = []
+            for element in target_elements:
+                # Sprawdź, czy element jest na właściwej ścieżce
+                parent = element
+                path_parts = list(parts)
+                path_parts.reverse()
+                path_parts.pop(0)  # Usuń nazwę elementu docelowego
+
+                is_matching = True
+                for part in path_parts:
+                    parent = parent.getparent() if hasattr(parent, 'getparent') else None
+                    if parent is None or parent.tag != part:
+                        is_matching = False
+                        break
+
+                if is_matching:
+                    filtered_elements.append(element)
+
+            # Jeśli nie znaleziono elementów z pełną ścieżką, użyj wszystkich pasujących elementów
+            elements = filtered_elements if filtered_elements else target_elements
+
+            urls = []
             for element in elements:
                 element_text = element.text
                 if element_text:
@@ -245,47 +278,77 @@ def extract_image_urls_from_xml(xml_content, xpath, separator=","):
                         urls.append(element_text.strip())
 
             return urls, None
-        except ET.ParseError as e:
-            # Próba alternatywnego parsowania
+
+        except ET.ParseError:
+            # Alternatywne parsowanie z użyciem minidom
+            import xml.dom.minidom as minidom
+
             try:
-                # Spróbujmy z minidom
-                import xml.dom.minidom as minidom
                 dom = minidom.parseString(xml_content)
 
-                # Ręczne wyszukiwanie elementów przy użyciu xpath-podobnego podejścia
-                # Przykład: dla xpath "//product/image" szukamy wszystkich elementów "image" wewnątrz "product"
-                parts = xpath.strip().split('/')
-                if parts[0] == '':
-                    parts = parts[1:]  # Usuń pusty element na początku
-                if parts[0] == '':
-                    parts = parts[1:]  # Znowu, dla ścieżek rozpoczynających się od //
+                # Podziel ścieżkę na części
+                if xpath_expression.startswith('//'):
+                    xpath_expression = xpath_expression[2:] # Usuń początkowe //
+                parts = xpath_expression.split('/')
+
+                # Znajdź wszystkie elementy o nazwie takiej jak ostatnia część ścieżki
+                elements = dom.getElementsByTagName(parts[-1])
 
                 urls = []
+                for element in elements:
+                    # Sprawdź, czy element jest na właściwej ścieżce
+                    if len(parts) > 1:
+                        parent = element.parentNode
+                        if parent.nodeName != parts[-2]:
+                            continue
 
-                if len(parts) == 2 and parts[0] == 'product' and parts[1] == 'image':
-                    products = dom.getElementsByTagName('product')
-                    for product in products:
-                        images = product.getElementsByTagName('image')
-                        for image in images:
-                            if image.firstChild and image.firstChild.nodeValue:
-                                element_text = image.firstChild.nodeValue
-                                if separator in element_text:
-                                    for url in element_text.split(separator):
-                                        url = url.strip()
-                                        if url:
-                                            urls.append(url)
-                                else:
-                                    urls.append(element_text.strip())
+                    if element.firstChild and element.firstChild.nodeValue:
+                        element_text = element.firstChild.nodeValue
+                        if separator in element_text:
+                            for url in element_text.split(separator):
+                                url = url.strip()
+                                if url:
+                                    urls.append(url)
+                        else:
+                            urls.append(element_text.strip())
 
                 return urls, None
-            except Exception as inner_e:
-                return None, f"Błąd podczas parsowania XML: {str(e)}. Dodatkowy błąd: {str(inner_e)}"
+
+            except Exception as mini_e:
+                # Ostateczna próba - ręczne parsowanie
+                try:
+                    # Prosta implementacja dla //product/image
+                    if xpath_expression == "//product/image" or xpath_expression == "product/image":
+                        image_pattern = re.compile(r'<image>(.*?)</image>', re.DOTALL)
+                        matches = image_pattern.findall(xml_content)
+
+                        urls = []
+                        for match in matches:
+                            match = match.strip()
+                            if separator in match:
+                                for url in match.split(separator):
+                                    url = url.strip()
+                                    if url:
+                                        urls.append(url)
+                            else:
+                                if match:
+                                    urls.append(match)
+
+                        return urls, None
+                    else:
+                        return None, f"Nieobsługiwana ścieżka XPath: {xpath_expression}"
+
+                except Exception as regex_e:
+                    return None, f"Nie udało się sparsować XML. Błąd: {str(regex_e)}"
 
     except Exception as e:
         return None, f"Nieoczekiwany błąd: {str(e)}"
 
-def update_xml_with_new_urls(xml_content, xpath, new_urls_map, new_node_name):
+def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_node_name):
     try:
+        if not xml_content or not xml_content.strip():
+            return None, "Plik XML jest pusty"
+
         # Usuń BOM, jeśli istnieje
         if xml_content.startswith("\ufeff"):
             xml_content = xml_content[1:]
@@ -293,46 +356,20 @@ def update_xml_with_new_urls(xml_content, xpath, new_urls_map, new_node_name):
         # Czyścimy problematyczne znaki
         xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
 
-        # Parsowanie XML
-        root = ET.fromstring(xml_content)
-        elements = root.findall(xpath)
+        # Ręczne parsowanie i aktualizacja XML dla //product/image
+        if xpath_expression == "//product/image" or xpath_expression == "product/image":
+            try:
+                # Użyj minidom do parsowania i aktualizacji
+                import xml.dom.minidom as minidom
+                dom = minidom.parseString(xml_content)
 
-        for element in elements:
-            if element.text in new_urls_map:
-                parent = None
-                for potential_parent in root.iter():
-                    if element in list(potential_parent):
-                        parent = potential_parent
-                        break
-
-                if parent is not None:
-                    new_element = ET.Element(new_node_name)
-                    new_element.text = new_urls_map[element.text]
-
-                    parent_index = list(parent).index(element)
-                    parent.insert(parent_index + 1, new_element)
-
-        return ET.tostring(root, encoding='unicode'), None
-    except Exception as e:
-        # Alternatywne podejście z minidom
-        try:
-            import xml.dom.minidom as minidom
-            dom = minidom.parseString(xml_content)
-
-            # Ręczne wyszukiwanie elementów przy użyciu xpath-podobnego podejścia
-            parts = xpath.strip().split('/')
-            if parts[0] == '':
-                parts = parts[1:]  # Usuń pusty element na początku
-            if parts[0] == '':
-                parts = parts[1:]  # Znowu, dla ścieżek rozpoczynających się od //
-
-            if len(parts) == 2 and parts[0] == 'product' and parts[1] == 'image':
+                # Znajdź wszystkie elementy image wewnątrz product
                 products = dom.getElementsByTagName('product')
                 for product in products:
                     images = product.getElementsByTagName('image')
                     for image in images:
                         if image.firstChild and image.firstChild.nodeValue:
-                            original_url = image.firstChild.nodeValue
+                            original_url = image.firstChild.nodeValue.strip()
                             if original_url in new_urls_map:
                                 # Utwórz nowy element
                                 new_element = dom.createElement(new_node_name)
@@ -340,11 +377,41 @@ def update_xml_with_new_urls(xml_content, xpath, new_urls_map, new_node_name):
                                 new_element.appendChild(new_text)
 
                                 # Wstaw po elemencie image
-                                product.insertBefore(new_element, image.nextSibling)
+                                if image.nextSibling:
+                                    product.insertBefore(new_element, image.nextSibling)
+                                else:
+                                    product.appendChild(new_element)
 
-            return dom.toxml(), None
-        except Exception as inner_e:
-            return None, f"Błąd podczas aktualizacji XML: {str(e)}. Dodatkowy błąd: {str(inner_e)}"
+                return dom.toxml(), None
+
+            except Exception as dom_e:
+                # Jeśli minidom zawiedzie, użyj wyrażeń regularnych
+                try:
+                    # Znajdź wszystkie tagi image wewnątrz product
+                    pattern = re.compile(r'(<product>.*?<image>(.*?)</image>)(.*?</product>)', re.DOTALL)
+
+                    def replace_func(match):
+                        before_image = match.group(1)
+                        image_content = match.group(2).strip()
+                        after_image = match.group(3)
+
+                        if image_content in new_urls_map:
+                            # Wstaw nowy element po image
+                            new_element = f"<{new_node_name}>{new_urls_map[image_content]}</{new_node_name}>"
+                            return f"{before_image}{after_image[:1]}{new_element}{after_image[1:]}"
+                        else:
+                            return match.group(0)
+
+                    updated_xml = re.sub(pattern, replace_func, xml_content)
+                    return updated_xml, None
+
+                except Exception as regex_e:
+                    return None, f"Nie udało się zaktualizować XML. Błąd: {str(regex_e)}"
+        else:
+            return None, f"Nieobsługiwana ścieżka XPath: {xpath_expression}"
+
+    except Exception as e:
+        return None, f"Nieoczekiwany błąd: {str(e)}"
 
 def extract_image_urls_from_csv(csv_content, column_name, separator=","):
     try:
