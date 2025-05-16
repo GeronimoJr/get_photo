@@ -492,10 +492,12 @@ def read_file_content(uploaded_file):
     except Exception as e:
         return None, f"Błąd podczas odczytu pliku: {str(e)}"
 
-def download_image(url, temp_dir):
+def download_image(url, temp_dir, debug_container=None):
     try:
         parsed_url = urlparse(url)
         if not parsed_url.scheme or not parsed_url.netloc:
+            if debug_container:
+                debug_container.error(f"Nieprawidłowy URL: {url}")
             return None, f"Nieprawidłowy URL: {url}"
 
         headers = {
@@ -510,7 +512,8 @@ def download_image(url, temp_dir):
             soup = BeautifulSoup(html_resp.text, "html.parser")
             img_tag = soup.find("img")
             if not img_tag or not img_tag.get("src"):
-                print(f"DEBUG: Brak <img> w HTML dla {url}")
+                if debug_container:
+                    debug_container.warning(f"Brak <img> w HTML dla {url}")
                 return None, "Nie znaleziono znacznika <img> w odpowiedzi HTML"
             img_src = img_tag["src"]
             img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}" if not img_src.startswith("http") else img_src
@@ -520,7 +523,8 @@ def download_image(url, temp_dir):
         for retry in range(3):
             try:
                 response = requests.get(img_url, headers=headers, stream=False, timeout=15, allow_redirects=True)
-                print(f"DEBUG: {img_url} -> HTTP {response.status_code}, Content-Type: {response.headers.get('Content-Type')}")
+                if debug_container:
+                    debug_container.info(f"{img_url} -> HTTP {response.status_code}, Content-Type: {response.headers.get('Content-Type')}")
                 response.raise_for_status()
                 extension = {
                     "image/jpeg": ".jpg", "image/png": ".png",
@@ -531,7 +535,8 @@ def download_image(url, temp_dir):
                 with open(file_path, "wb") as f:
                     f.write(response.content)
                 file_size = os.path.getsize(file_path)
-                print(f"DEBUG: Zapisano {file_path}, rozmiar: {file_size} bajtów")
+                if debug_container:
+                    debug_container.info(f"Zapisano {file_path}, rozmiar: {file_size} bajtów")
                 if file_size > 100 and file_size < 20 * 1024 * 1024:
                     return {"path": file_path, "filename": filename, "original_url": url}, None
                 else:
@@ -539,17 +544,21 @@ def download_image(url, temp_dir):
                     if retry < 2:
                         continue
                     if file_size <= 100:
-                        print(f"DEBUG: Plik za mały: {file_size} bajtów dla {url}")
+                        if debug_container:
+                            debug_container.warning(f"Plik za mały: {file_size} bajtów dla {url}")
                         return None, f"Pobrany plik jest zbyt mały (rozmiar: {file_size})"
                     else:
-                        print(f"DEBUG: Plik za duży: {file_size} bajtów dla {url}")
+                        if debug_container:
+                            debug_container.warning(f"Plik za duży: {file_size} bajtów dla {url}")
                         return None, f"Plik jest zbyt duży (>20MB, rozmiar: {file_size})"
             except Exception as e:
-                print(f"EXCEPTION: {img_url} -> {traceback.format_exc()}")
+                if debug_container:
+                    debug_container.error(f"EXCEPTION: {img_url} -> {str(e)}")
                 if retry == 2:
                     return None, f"Błąd przy pobieraniu: {str(e)}"
     except Exception as e:
-        print(f"EXCEPTION (outer): {url} -> {traceback.format_exc()}")
+        if debug_container:
+            debug_container.error(f"EXCEPTION (outer): {url} -> {str(e)}")
         return None, f"Błąd: {str(e)}"
 
 def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_container=None):
@@ -558,7 +567,7 @@ def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_c
         if debug_container:
             debug_container.info(f"⬇️ Pobieranie: {url}")
             
-        image_info, error = download_image(url, temp_dir)
+        image_info, error = download_image(url, temp_dir, debug_container=debug_container)
         
         if error:
             # Dodane bardziej szczegółowe komunikaty dla częstych błędów
