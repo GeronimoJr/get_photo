@@ -59,7 +59,7 @@ def initialize_session_state():
             "username": "",
             "password": "",
             "directory": "/",
-            "http_path": ""  # Dodane pole na ścieżkę HTTP
+            "http_path": ""
         }
 
 def read_file_content(uploaded_file):
@@ -141,7 +141,6 @@ def download_image(url, temp_dir):
             "Referer": f"{parsed_url.scheme}://{parsed_url.netloc}/",
         }
 
-        # Obsługa image_show.php z RM Gastro
         if "image_show.php" in url:
             html_resp = requests.get(url, headers=headers, timeout=10)
             html_resp.raise_for_status()
@@ -152,16 +151,14 @@ def download_image(url, temp_dir):
             if not img_tag or not img_tag.get("src"):
                 return None, "Nie znaleziono znacznika <img> w odpowiedzi HTML"
 
-            # Budujemy pełny URL do obrazka
             img_src = img_tag["src"]
             if not img_src.startswith("http"):
                 img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}"
             else:
                 img_url = img_src
         else:
-            img_url = url  # standardowy przypadek
+            img_url = url
 
-        # Pobieramy właściwy obraz
         response = requests.get(img_url, headers=headers, stream=True, timeout=15)
         response.raise_for_status()
 
@@ -169,7 +166,6 @@ def download_image(url, temp_dir):
         if not content_type.startswith("image/"):
             return None, f"Nieprawidłowy Content-Type: {content_type}"
 
-        # Nadajemy nazwę pliku
         extension = {
             "image/jpeg": ".jpg",
             "image/png": ".png",
@@ -191,7 +187,6 @@ def download_image(url, temp_dir):
 
     except Exception as e:
         return None, f"Błąd: {str(e)}"
-
 
 def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
     try:
@@ -224,14 +219,12 @@ def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
         with open(file_path, 'rb') as file:
             ftp.storbinary(f'STOR {remote_filename}', file)
 
-        # Tworzenie URL do zdjęcia - używamy ścieżki HTTP jeśli jest dostępna
         if ftp_settings.get("http_path") and ftp_settings["http_path"].strip():
             http_path = ftp_settings["http_path"].strip()
             if not http_path.endswith('/'):
                 http_path += '/'
             image_url = f"{http_path}{remote_filename}"
         else:
-            # Fallback do FTP URL jeśli ścieżka HTTP nie jest dostępna
             image_url = f"ftp://{ftp_settings['host']}"
             if ftp_settings["directory"] and ftp_settings["directory"] != "/":
                 if not ftp_settings["directory"].startswith("/"):
@@ -320,136 +313,40 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
 
         xml_content = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", xml_content)
 
-        # Sprawdzamy, czy mamy do czynienia z prostym przypadkiem product/image
         if xpath_expression == "//product/image" or xpath_expression == "product/image":
             try:
                 updated_xml = xml_content
 
-                # Debugowanie
-                st.write(f"Aktualizacja XML z {len(new_urls_map)} nowymi URL-ami")
-
                 for original_url, new_url in new_urls_map.items():
-                    # Escapujemy URL dla użycia w wyrażeniu regularnym
                     escaped_url = re.escape(original_url)
-                    # Szukamy węzła <image> zawierającego oryginalny URL
                     pattern = f"(<image>{escaped_url}</image>)"
-
-                    # Sprawdzamy, czy już istnieje węzeł z nową nazwą po węźle <image>
                     check_pattern = f"<image>{escaped_url}</image>\\s*<{new_node_name}>"
                     if not re.search(check_pattern, updated_xml):
-                        # Dodajemy nowy węzeł po węźle <image>
                         replacement = f"\\1\n<{new_node_name}>{new_url}</{new_node_name}>"
                         updated_xml = re.sub(pattern, replacement, updated_xml)
-                        # Debugowanie
-                        st.write(f"Dodano nowy węzeł dla {original_url}")
 
                 return updated_xml, None
             except Exception as e:
-                st.error(f"Błąd podczas aktualizacji XML z wyrażeniami regularnymi: {str(e)}")
                 return None, f"Błąd podczas aktualizacji XML z wyrażeniami regularnymi: {str(e)}"
 
         try:
-            # Używamy niestandardowego parsera, który zachowuje komentarze
-            parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
-            root = ET.fromstring(xml_content, parser=parser)
+            # Używamy alternatywnego podejścia z wyrażeniami regularnymi
+            updated_xml = xml_content
+            node_name = xpath_expression.split("/")[-1]
+            
+            for original_url, new_url in new_urls_map.items():
+                escaped_url = re.escape(original_url)
+                pattern = f"(<{node_name}>{escaped_url}</{node_name}>)"
+                check_pattern = f"<{node_name}>{escaped_url}</{node_name}>\\s*<{new_node_name}>"
+                if not re.search(check_pattern, updated_xml):
+                    replacement = f"\\1\n<{new_node_name}>{new_url}</{new_node_name}>"
+                    updated_xml = re.sub(pattern, replacement, updated_xml)
 
-            # Debugowanie
-            st.write(f"Parsowanie XML z XPath: {xpath_expression}")
-
-            # Normalizujemy XPath
-            if xpath_expression.startswith("//"):
-                xpath_parts = xpath_expression[2:].split("/")
-                search_path = ".//" + xpath_parts[-1]
-            elif not xpath_expression.startswith("./"):
-                search_path = f"./{xpath_expression}"
-            else:
-                search_path = xpath_expression
-
-            # Debugowanie
-            st.write(f"Znormalizowany XPath: {search_path}")
-
-            # Szukamy wszystkich elementów pasujących do XPath
-            found_elements = 0
-            updated_elements = 0
-
-            for element in root.findall(search_path):
-                found_elements += 1
-                element_text = element.text.strip() if element.text else ""
-
-                if element_text in new_urls_map:
-                    # Szukamy rodzica elementu
-                    parent = None
-                    for p in root.iter():
-                        if element in list(p):
-                            parent = p
-                            break
-
-                    if parent is not None:
-                        # Sprawdzamy, czy węzeł z nową nazwą już istnieje
-                        existing_node = None
-                        for sibling in parent:
-                            if sibling.tag == new_node_name and sibling.text == new_urls_map[element_text]:
-                                existing_node = sibling
-                                break
-
-                        # Dodajemy nowy węzeł tylko jeśli jeszcze nie istnieje
-                        if existing_node is None:
-                            new_element = ET.Element(new_node_name)
-                            new_element.text = new_urls_map[element_text]
-                            idx = list(parent).index(element)
-                            parent.insert(idx + 1, new_element)
-                            updated_elements += 1
-                            # Debugowanie
-                            st.write(f"Dodano nowy węzeł {new_node_name} dla URL: {element_text}")
-
-            # Debugowanie
-            st.write(f"Znaleziono {found_elements} elementów, zaktualizowano {updated_elements}")
-
-            # Jeśli nic nie zaktualizowano, sprawdź czy XPath jest poprawny
-            if found_elements == 0:
-                st.warning(f"Nie znaleziono żadnych elementów pasujących do XPath: {search_path}")
-                # Próbujemy bardziej ogólnego XPath
-                fallback_xpath = f".//{xpath_expression.split('/')[-1]}"
-                st.write(f"Próba z alternatywnym XPath: {fallback_xpath}")
-                elements = root.findall(fallback_xpath)
-                if elements:
-                    st.write(f"Znaleziono {len(elements)} elementów z alternatywnym XPath")
-                    for element in elements:
-                        st.write(f"Element: {element.tag}, tekst: {element.text if element.text else 'pusty'}")
-
-            # Konwertujemy z powrotem do stringa
-            updated_xml = ET.tostring(root, encoding="unicode", method="xml")
             return updated_xml, None
-
-        except ET.ParseError as e:
-            st.error(f"Błąd podczas parsowania XML: {str(e)}")
-            # Próbujemy alternatywnego podejścia z wyrażeniami regularnymi
-            st.write("Próba alternatywnego podejścia z wyrażeniami regularnymi...")
-
-            try:
-                updated_xml = xml_content
-                pattern_template = r"<{0}>(.*?)</{0}>"
-
-                # Wyciągamy nazwę węzła z XPath
-                node_name = xpath_expression.split("/")[-1]
-                pattern = pattern_template.format(node_name)
-
-                for original_url, new_url in new_urls_map.items():
-                    escaped_url = re.escape(original_url)
-                    node_pattern = f"<{node_name}>{escaped_url}</{node_name}>"
-                    check_pattern = f"<{node_name}>{escaped_url}</{node_name}>\\s*<{new_node_name}>"
-
-                    if not re.search(check_pattern, updated_xml):
-                        replacement = f"<{node_name}>{original_url}</{node_name}>\n<{new_node_name}>{new_url}</{new_node_name}>"
-                        updated_xml = updated_xml.replace(f"<{node_name}>{original_url}</{node_name}>", replacement)
-
-                return updated_xml, None
-
-            except Exception as regex_error:
-                return None, f"Błąd podczas aktualizacji XML: {str(e)}\nBłąd alternatywnej metody: {str(regex_error)}"
+        except Exception as e:
+            return None, f"Błąd podczas aktualizacji XML: {str(e)}"
 
     except Exception as e:
-        st.error(f"Nieoczekiwany błąd: {str(e)}")
         return None, f"Nieoczekiwany błąd: {str(e)}"
 
 def extract_image_urls_from_csv(csv_content, column_name, separator=","):
@@ -481,71 +378,29 @@ def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_
         if not new_column_name or not new_column_name.strip():
             return None, "Nazwa nowej kolumny nie może być pusta"
 
-        # Debugowanie
-        st.write(f"Aktualizacja CSV z {len(new_urls_map)} nowymi URL-ami")
-        st.write(f"Kolumna źródłowa: {column_name}, nowa kolumna: {new_column_name}")
-
-        # Wczytujemy CSV do DataFrame
         df = pd.read_csv(io.StringIO(csv_content))
 
         if column_name not in df.columns:
             return None, f"Kolumna '{column_name}' nie istnieje w pliku CSV."
 
-        # Dodajemy nową kolumnę jeśli jeszcze nie istnieje
         if new_column_name not in df.columns:
             df[new_column_name] = ""
-            st.write(f"Utworzono nową kolumnę: {new_column_name}")
 
-        # Wypełniamy nową kolumnę wartościami z mapy URL-i
-        updated_rows = 0
         for idx, value in enumerate(df[column_name]):
             if pd.notna(value):
                 value_str = str(value).strip()
                 if value_str in new_urls_map:
                     df.at[idx, new_column_name] = new_urls_map[value_str]
-                    updated_rows += 1
-                    # Debugowanie
-                    if updated_rows <= 5:  # Pokaż tylko pierwsze 5 aktualizacji
-                        st.write(f"Zaktualizowano wiersz {idx+1}: {value_str} -> {new_urls_map[value_str]}")
-
-        st.write(f"Zaktualizowano {updated_rows} wierszy w pliku CSV")
-
-        # Jeśli nie zaktualizowano żadnego wiersza, spróbujmy bardziej szczegółowego debugowania
-        if updated_rows == 0:
-            st.warning("Nie zaktualizowano żadnego wiersza. Sprawdzanie przyczyny...")
-
-            # Sprawdźmy kilka pierwszych wartości w kolumnie źródłowej
-            st.write("Pierwsze 5 wartości w kolumnie źródłowej:")
-            for idx, value in enumerate(df[column_name].head(5)):
-                st.write(f"{idx+1}. '{value}'")
-
-            # Sprawdźmy kilka pierwszych kluczy w mapie URL-i
-            st.write("Pierwsze 5 kluczy w mapie URL-i:")
-            for idx, key in enumerate(list(new_urls_map.keys())[:5]):
-                st.write(f"{idx+1}. '{key}'")
-
-            # Sprawdźmy, czy problem może być z typami danych
-            st.write(f"Typ danych kolumny {column_name}: {df[column_name].dtype}")
-
-            # Spróbujmy alternatywnego podejścia - porównanie bez białych znaków
-            updated_alt = 0
-            for idx, value in enumerate(df[column_name]):
-                if pd.notna(value):
-                    value_str = str(value).strip()
+                else:
+                    # Sprawdzamy alternatywne dopasowanie bez białych znaków
                     for key in new_urls_map:
                         if value_str.replace(" ", "") == key.replace(" ", ""):
                             df.at[idx, new_column_name] = new_urls_map[key]
-                            updated_alt += 1
                             break
 
-            if updated_alt > 0:
-                st.success(f"Alternatywne podejście zaktualizowało {updated_alt} wierszy")
-
-        # Konwertujemy z powrotem do stringa
         return df.to_csv(index=False), None
 
     except Exception as e:
-        st.error(f"Błąd podczas aktualizacji CSV: {str(e)}")
         return None, f"Błąd podczas aktualizacji CSV: {str(e)}"
 
 def reset_app_state():
@@ -628,7 +483,6 @@ def main():
                 "Katalog docelowy", 
                 value=st.session_state.ftp_settings["directory"]
             )
-            # Nowe pole dla ścieżki HTTP
             st.session_state.ftp_settings["http_path"] = st.text_input(
                 "Ścieżka HTTP do zdjęć (np. https://example.com/images/)",
                 value=st.session_state.ftp_settings.get("http_path", ""),
@@ -652,7 +506,6 @@ def main():
             file_type = st.session_state.file_info["type"]
             file_content = st.session_state.file_info["content"]
 
-            # Sprawdzenie, czy wszystkie wymagane pola są wypełnione
             if file_type == "xml" and (not xpath or not xpath.strip() or not new_node_name or not new_node_name.strip()):
                 st.error("Podaj prawidłowy XPath i nazwę nowego węzła!")
                 st.stop()
