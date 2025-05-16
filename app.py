@@ -493,145 +493,58 @@ def read_file_content(uploaded_file):
 
 def download_image(url, temp_dir):
     try:
-        # Walidacja URL
-        if not url or not url.strip():
-            return None, "Pusty URL"
-            
         parsed_url = urlparse(url)
         if not parsed_url.scheme or not parsed_url.netloc:
-            return None, f"Nieprawidłowy format URL: {url}"
+            return None, f"Nieprawidłowy URL: {url}"
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
+            "User-Agent": "Mozilla/5.0", "Accept": "*/*",
             "Referer": f"{parsed_url.scheme}://{parsed_url.netloc}/"
         }
 
         # Specjalna obsługa dla image_show.php
         if "image_show.php" in url:
-            try:
-                # Zwiększ timeout dla powolnych serwerów
-                html_resp = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
-                html_resp.raise_for_status()
-                
-                # Używamy BeautifulSoup do parsowania HTML
-                soup = BeautifulSoup(html_resp.text, "html.parser")
-                img_tag = soup.find("img")
-                
-                # Jeśli nie ma tagu <img>, spróbujmy inne podejście
-                if not img_tag or not img_tag.get("src"):
-                    # Sprawdź czy jest przekierowanie w meta tag
-                    meta_refresh = soup.find("meta", attrs={"http-equiv": "refresh"})
-                    if meta_refresh and meta_refresh.get("content"):
-                        content = meta_refresh.get("content")
-                        url_match = re.search(r'URL=([^"]+)', content, re.IGNORECASE)
-                        if url_match:
-                            img_url = url_match.group(1)
-                            if not img_url.startswith("http"):
-                                img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_url.lstrip('/')}"
-                        else:
-                            return None, "Nie znaleziono przekierowania w meta refresh tag"
-                    else:
-                        # Sprawdzamy, czy nie ma obrazu jako tło 
-                        body_style = soup.find("body")
-                        if body_style and body_style.get("style"):
-                            style = body_style.get("style")
-                            url_match = re.search(r'url\([\'"]?([^\'")]+)', style)
-                            if url_match:
-                                img_url = url_match.group(1)
-                                if not img_url.startswith("http"):
-                                    img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_url.lstrip('/')}"
-                            else:
-                                return None, "Nie znaleziono obrazu w stylu body"
-                        else:
-                            return None, "Nie znaleziono znacznika <img> ani alternatywnych źródeł obrazu"
-                else:
-                    img_src = img_tag["src"]
-                    img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}" if not img_src.startswith("http") else img_src
-            except requests.exceptions.RequestException as e:
-                return None, f"Błąd pobierania strony HTML: {str(e)}"
+            html_resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+            html_resp.raise_for_status()
+            soup = BeautifulSoup(html_resp.text, "html.parser")
+            img_tag = soup.find("img")
+            if not img_tag or not img_tag.get("src"):
+                return None, "Nie znaleziono znacznika <img> w odpowiedzi HTML"
+            img_src = img_tag["src"]
+            img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}" if not img_src.startswith("http") else img_src
         else:
             img_url = url
 
-        # Próby pobrania obrazu z obsługą różnych scenariuszy
         for retry in range(3):
             try:
-                # Zwiększ timeout dla powolnych serwerów
-                response = requests.get(img_url, headers=headers, stream=True, timeout=30, allow_redirects=True)
+                response = requests.get(img_url, headers=headers, stream=False, timeout=15, allow_redirects=True)
                 response.raise_for_status()
-                
-                # Sprawdź typ zawartości
-                content_type = response.headers.get("Content-Type", "").lower()
-                
-                # Jeśli to nie jest obraz, ale mamy przekierowanie, spróbuj je obsłużyć
-                if not content_type.startswith("image/"):
-                    if retry < 2:
-                        if 'location' in response.headers:
-                            img_url = response.headers['location']
-                            continue
-                        elif content_type.startswith("text/html"):
-                            # Spróbuj znaleźć obraz w HTML
-                            soup = BeautifulSoup(response.text, "html.parser")
-                            img_tag = soup.find("img")
-                            if img_tag and img_tag.get("src"):
-                                img_url = img_tag["src"]
-                                if not img_url.startswith("http"):
-                                    img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_url.lstrip('/')}"
-                                continue
-                    return None, f"Nieprawidłowy typ zawartości: {content_type}"
-                
-                # Określ rozszerzenie pliku
+                content_type = response.headers.get("Content-Type", "")
+                # Ustal rozszerzenie na podstawie Content-Type, ale nie wymagaj image/
                 extension = {
-                    "image/jpeg": ".jpg",
-                    "image/png": ".png",
-                    "image/gif": ".gif",
-                    "image/webp": ".webp",
-                    "image/bmp": ".bmp",
-                    "image/tiff": ".tiff"
+                    "image/jpeg": ".jpg", "image/png": ".png",
+                    "image/gif": ".gif", "image/webp": ".webp"
                 }.get(content_type, ".jpg")
-                
-                # Generuj unikalną nazwę pliku
                 filename = f"image_{uuid.uuid4().hex}{extension}"
                 file_path = os.path.join(temp_dir, filename)
-                
-                # Zapisz plik z weryfikacją rozmiaru - używaj chunked download
                 with open(file_path, "wb") as f:
-                    downloaded = 0
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            # Sprawdź czy plik nie jest za duży podczas pobierania
-                            if downloaded > 20 * 1024 * 1024:  # 20MB limit
-                                f.close()
-                                os.remove(file_path)
-                                return None, "Plik jest zbyt duży (>20MB)"
-                
-                # Sprawdź czy plik został poprawnie zapisany
-                if os.path.exists(file_path):
-                    file_size = os.path.getsize(file_path)
-                    if file_size < 100:  # Plik jest podejrzanie mały
-                        os.remove(file_path)
-                        if retry < 2:
-                            continue
-                        return None, "Pobrany plik jest zbyt mały"
-                    elif file_size > 20 * 1024 * 1024:  # Większy niż 20MB
-                        os.remove(file_path)
-                        return None, "Plik jest zbyt duży (>20MB)"
+                    f.write(response.content)
+                file_size = os.path.getsize(file_path)
+                if file_size > 100 and file_size < 20 * 1024 * 1024:
                     return {"path": file_path, "filename": filename, "original_url": url}, None
                 else:
-                    return None, "Nie udało się zapisać pliku"
-                    
-            except requests.exceptions.RequestException as e:
+                    os.remove(file_path)
+                    if retry < 2:
+                        continue
+                    if file_size <= 100:
+                        return None, "Pobrany plik jest zbyt mały"
+                    else:
+                        return None, "Plik jest zbyt duży (>20MB)"
+            except Exception as e:
                 if retry == 2:
-                    return None, f"Błąd pobierania obrazu: {str(e)}"
-                time.sleep(retry + 1)  # Zwiększające się opóźnienie między próbami
-    
+                    return None, f"Błąd przy pobieraniu: {str(e)}"
     except Exception as e:
-        return None, f"Nieoczekiwany błąd: {str(e)}"
+        return None, f"Błąd: {str(e)}"
 
 def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_container=None):
     """Pomocnicza funkcja do przetwarzania pojedynczego URL"""
