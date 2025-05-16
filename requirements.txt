@@ -5,3 +5,7 @@ lxml
 beautifulsoup4
 google-auth
 PyDrive2
+urllib3
+python-dateutil
+Pillow
+oauth2client
