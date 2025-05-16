@@ -786,7 +786,7 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
                             debug_container.info(f"🔄 Ponawiam {result['retry_count']}/{max_retries} dla {url}: {result.get('error')}")
                         time.sleep(random.uniform(0.5, 1.0))
                         retry_queue.put((url, result["retry_count"]))
-                    else  # error
+                    else: error
                         failed_urls.append({"url": url, "error": result.get("error", "Nieznany błąd")})
                         processed_count += 1
                         if debug_container:
