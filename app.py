@@ -566,7 +566,6 @@ def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, log_lis
     try:
         if log_list is not None:
             log_list.append(f"⬇️ Pobieranie: {url}")
-            
         image_info, error = download_image(url, temp_dir, log_list=log_list)
         
         if error:
@@ -757,6 +756,7 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
     next_url_index = initial_batch_size
     
     # Process until queue is empty and all URLs are processed
+    log_list = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         while not retry_queue.empty() or next_url_index < total_urls or ftp_tasks:
             # Sprawdź status zadań FTP
