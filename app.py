@@ -23,13 +23,6 @@ import queue
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-# Dodaj import na górze pliku
-try:
-    from streamlit_autorefresh import st_autorefresh
-except ImportError:
-    import subprocess
-    subprocess.run(['pip', 'install', 'streamlit-autorefresh'])
-    from streamlit_autorefresh import st_autorefresh
 
 # Stałe konfiguracyjne
 FTP_CONFIG = {
@@ -815,12 +808,6 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
                 debug_container.info(f"📋 W kolejce pobierania: {queue_size} | W kolejce FTP: {ftp_queue_size} | Zaplanowano: {next_url_index}/{total_urls}")
             
             if retry_queue.empty() and next_url_index >= total_urls and ftp_tasks:
-                # --- Dodaj aktualizację postępu podczas oczekiwania na FTP ---
-                if progress_callback and total_urls > 0:
-                    stats = ftp_batch_manager.get_stats()
-                    progress = min(0.99, max(0.01, (processed_count) / total_urls))
-                    progress_callback(progress, processed_count, stats['total_uploaded'], total_urls)
-                    save_current_state()  # Zapisz stan również tutaj
                 time.sleep(0.1)
                 continue
             
@@ -1214,8 +1201,10 @@ def save_processing_state(session_id, urls, processed_urls, new_urls_map, file_i
     # Ensure all lists have unique entries
     all_urls = list(set(urls))
     processed_urls = list(set(processed_urls))
+    
     # Calculate remaining URLs accurately
     remaining_urls = [url for url in all_urls if url not in processed_urls]
+    
     state = {
         "session_id": session_id,
         "timestamp": datetime.now().isoformat(),
@@ -1227,21 +1216,14 @@ def save_processing_state(session_id, urls, processed_urls, new_urls_map, file_i
         "remaining_urls": remaining_urls,
         "file_content": file_info.get("content", "")
     }
+    
     state_dir = os.path.join(os.path.expanduser("~"), ".xml_image_processor")
     os.makedirs(state_dir, exist_ok=True)
     state_file = os.path.join(state_dir, f"session_{session_id}.json")
-    # Backup poprzedniego stanu
-    if os.path.exists(state_file):
-        try:
-            import shutil
-            shutil.copy2(state_file, state_file + ".bak")
-        except Exception as e:
-            print(f"Błąd backupu stanu: {str(e)}")
-    try:
-        with open(state_file, "w") as f:
-            json.dump(state, f)
-    except Exception as e:
-        print(f"Błąd zapisu stanu: {str(e)}")
+    
+    with open(state_file, "w") as f:
+        json.dump(state, f)
+    
     return state_file
 
 def verify_state_consistency(state):
@@ -1359,16 +1341,23 @@ def resume_processing(state, temp_dir, ftp_settings, max_workers=5):
     file_info = state["file_info"]
     processing_params = state["processing_params"]
     session_id = state["session_id"]
+    
+    # Przywróć parametry przetwarzania do sesji
     st.session_state.file_info = file_info
     st.session_state.processing_params = processing_params
+    
     if not remaining_urls:
         st.success("Wszystkie URL-e zostały już przetworzone.")
         return True
+    
     progress_bar = st.progress(len(state["processed_urls"]) / state["total_urls"])
     status_text = st.empty()
     debug_area = st.empty()
+    
     total_to_process = len(remaining_urls)
     status_text.text(f"Inicjalizacja wznawiania przetwarzania {len(remaining_urls)} pozostałych obrazów...")
+    
+    # Pre-inicjalizacja FTP dla szybszego startu
     if debug_area:
         debug_area.info("Przygotowanie połączenia FTP...")
     try:
@@ -1377,12 +1366,19 @@ def resume_processing(state, temp_dir, ftp_settings, max_workers=5):
     except Exception as e:
         if debug_area:
             debug_area.warning(f"Problem z wstępnym połączeniem FTP: {str(e)}")
+            
+    # Mierzenie czasu wykonania
     start_time = time.time()
+    
+    # Funkcja aktualizacji postępu z większą ilością szczegółów
     def update_progress(progress_value, processed, total_processed, total):
+        # Oblicz całkowity progres uwzględniając już przetworzone obrazy
         overall_progress = (len(state["processed_urls"]) + total_processed) / state["total_urls"]
         progress_bar.progress(overall_progress)
+        
         percent = int(progress_value*100)
         elapsed_time = time.time() - start_time
+        
         if processed > 0 and elapsed_time > 0:
             speed = processed / elapsed_time
             remaining = (total - processed) / speed if speed > 0 else 0
@@ -1391,31 +1387,40 @@ def resume_processing(state, temp_dir, ftp_settings, max_workers=5):
         else:
             time_info = ""
             speed_info = ""
+            
         status_text.text(f"Przetwarzanie... {total_processed}/{total} ({percent}%){speed_info}{time_info}")
-    try:
-        batch_result, batch_downloaded, failed_urls = process_images_in_parallel(
-            remaining_urls, 
-            temp_dir, 
-            ftp_settings,
-            max_workers=max_workers,
-            debug_container=debug_area,
-            max_retries=3,
-            progress_callback=update_progress,
-            session_id=session_id
-        )
-        new_urls_map.update(batch_result)
-        processed_urls = state.get("processed_urls", []) + list(batch_result.keys())
-        processed_urls = list(set(processed_urls))
-    finally:
-        save_processing_state(
-            session_id, 
-            list(set(state["remaining_urls"] + state["processed_urls"])),
-            processed_urls if 'processed_urls' in locals() else state.get("processed_urls", []),
-            new_urls_map,
-            file_info,
-            processing_params
-        )
+    
+    # Use our improved parallel processing function
+    batch_result, batch_downloaded, failed_urls = process_images_in_parallel(
+        remaining_urls, 
+        temp_dir, 
+        ftp_settings,
+        max_workers=max_workers,
+        debug_container=debug_area,
+        max_retries=3,
+        progress_callback=update_progress,
+        session_id=session_id
+    )
+    
+    # Update state with new results
+    new_urls_map.update(batch_result)
+    processed_urls = state.get("processed_urls", []) + list(batch_result.keys())
+    
+    # Remove duplicates if any
+    processed_urls = list(set(processed_urls))
+    
+    # Save the updated state
+    save_processing_state(
+        session_id, 
+        list(set(state["remaining_urls"] + state["processed_urls"])),  # Remove duplicates 
+        processed_urls, 
+        new_urls_map, 
+        file_info,
+        processing_params
+    )
+    
     status_text.text(f"Zakończono wznowione przetwarzanie. Pobrano i przesłano {len(batch_downloaded)} obrazów.")
+    
     # Report on failed URLs
     if failed_urls:
         with st.expander(f"Nie udało się przetworzyć {len(failed_urls)} URL-i"):
@@ -1423,6 +1428,7 @@ def resume_processing(state, temp_dir, ftp_settings, max_workers=5):
                 st.warning(f"{fail['url']}: {fail['error']}")
             if len(failed_urls) > 20:
                 st.warning(f"... oraz {len(failed_urls) - 20} więcej.")
+    
     # Aktualizacja pliku po wszystkich pobraniach
     if new_urls_map:
         file_type = file_info["type"]
@@ -1730,7 +1736,6 @@ def main():
                 return
 
     with tab2:
-        st_autorefresh(interval=5000, key="autorefresh_sessions")
         st.subheader("Wznów wcześniej przerwane przetwarzanie")
         
         saved_sessions = list_saved_sessions()
