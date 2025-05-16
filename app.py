@@ -17,7 +17,6 @@ from bs4 import BeautifulSoup
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 from oauth2client.service_account import ServiceAccountCredentials
-import concurrent.futures
 
 class FTPManager:
     def __init__(self, settings):
@@ -31,7 +30,6 @@ class FTPManager:
             self.ftp = ftplib.FTP()
             self.ftp.connect(self.settings["host"], self.settings["port"])
             self.ftp.login(self.settings["username"], self.settings["password"])
-            
             if self.settings["directory"] and self.settings["directory"] != "/":
                 try:
                     self.ftp.cwd(self.settings["directory"])
@@ -42,11 +40,9 @@ class FTPManager:
                         except ftplib.error_perm:
                             self.ftp.mkd(directory)
                             self.ftp.cwd(directory)
-            
             self.connected = True
             return True
         except Exception as e:
-            print(f"FTP connection error: {str(e)}")
             self.connected = False
             return False
             
@@ -55,14 +51,11 @@ class FTPManager:
             return {"success": False, "error": "Nie można połączyć się z serwerem FTP"}
         if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
             return {"success": False, "error": f"Plik nie istnieje lub jest pusty: {file_path}"}
-            
         try:
             if not remote_filename:
                 remote_filename = os.path.basename(file_path)
-
             with open(file_path, 'rb') as file:
                 self.ftp.storbinary(f'STOR {remote_filename}', file)
-
             if self.settings.get("http_path"):
                 http_path = self.settings["http_path"].strip()
                 if not http_path.endswith('/'): http_path += '/'
@@ -76,7 +69,6 @@ class FTPManager:
                 else:
                     image_url += "/"
                 image_url += remote_filename
-
             return {"success": True, "url": image_url, "filename": remote_filename}
         except Exception as e:
             self.connected = False
@@ -85,8 +77,6 @@ class FTPManager:
             try:
                 with open(file_path, 'rb') as file:
                     self.ftp.storbinary(f'STOR {remote_filename}', file)
-                    
-                # Powtórzenie kodu budowy URL-a z pierwszej próby
                 if self.settings.get("http_path"):
                     http_path = self.settings["http_path"].strip()
                     if not http_path.endswith('/'): http_path += '/'
@@ -100,7 +90,6 @@ class FTPManager:
                     else:
                         image_url += "/"
                     image_url += remote_filename
-                
                 return {"success": True, "url": image_url, "filename": remote_filename}
             except:
                 return {"success": False, "error": "Nie udało się przesłać pliku nawet po ponownym połączeniu"}
@@ -111,11 +100,9 @@ class FTPManager:
             except: pass
             self.connected = False
 
-# Funkcje pomocnicze
 def authenticate_user():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
-
     if not st.session_state.authenticated:
         st.title("Pobieranie zdjęć z XML/CSV - Logowanie")
         user = st.text_input("Login")
@@ -143,7 +130,6 @@ def initialize_session_state():
             "new_column_name": "", "separator": ","
         }
     }
-    
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -151,17 +137,12 @@ def initialize_session_state():
 def read_file_content(uploaded_file):
     if not uploaded_file:
         return None, "Nie wybrano pliku"
-
     try:
         raw_bytes = uploaded_file.read()
         file_type = uploaded_file.name.split(".")[-1].lower()
-
         if file_type not in ["xml", "csv"]:
             return None, "Nieobsługiwany typ pliku. Akceptowane formaty to XML i CSV."
-
-        # Próba autodetekcji kodowania
         if file_type == "xml":
-            # Sprawdź BOM UTF-16
             if raw_bytes.startswith(codecs.BOM_UTF16_LE) or raw_bytes.startswith(codecs.BOM_UTF16_BE):
                 try:
                     encoding = 'utf-16-le' if raw_bytes.startswith(codecs.BOM_UTF16_LE) else 'utf-16-be'
@@ -169,8 +150,6 @@ def read_file_content(uploaded_file):
                             "type": file_type, "encoding": 'utf-16', "name": uploaded_file.name}, None
                 except UnicodeDecodeError:
                     pass
-
-            # Sprawdź zadeklarowane kodowanie w XML
             encoding_match = re.search(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', raw_bytes)
             if encoding_match:
                 try:
@@ -179,16 +158,12 @@ def read_file_content(uploaded_file):
                             "type": file_type, "encoding": encoding, "name": uploaded_file.name}, None
                 except:
                     pass
-
-        # Próbuj różne kodowania
         for enc in ["utf-8", "iso-8859-2", "windows-1250", "utf-16-le", "utf-16-be"]:
             try:
                 return {"content": raw_bytes.decode(enc), "raw_bytes": raw_bytes, 
                         "type": file_type, "encoding": enc, "name": uploaded_file.name}, None
             except UnicodeDecodeError:
                 continue
-
-        # Specjalna obsługa dla CSV
         if file_type == "csv":
             try:
                 buffer = io.BytesIO(raw_bytes)
@@ -198,9 +173,7 @@ def read_file_content(uploaded_file):
                         "name": uploaded_file.name, "dataframe": df}, None
             except:
                 pass
-
         return None, "Nie udało się odczytać pliku – nieznane kodowanie."
-
     except Exception as e:
         return None, f"Błąd podczas odczytu pliku: {str(e)}"
 
@@ -209,137 +182,93 @@ def download_image(url, temp_dir):
         parsed_url = urlparse(url)
         if not parsed_url.scheme or not parsed_url.netloc:
             return None, f"Nieprawidłowy URL: {url}"
-
         headers = {
             "User-Agent": "Mozilla/5.0", "Accept": "*/*",
             "Referer": f"{parsed_url.scheme}://{parsed_url.netloc}/"
         }
-
-        # Specjalna obsługa dla image_show.php
         if "image_show.php" in url:
             html_resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
             html_resp.raise_for_status()
-            
             soup = BeautifulSoup(html_resp.text, "html.parser")
             img_tag = soup.find("img")
             if not img_tag or not img_tag.get("src"):
                 return None, "Nie znaleziono znacznika <img> w odpowiedzi HTML"
-
             img_src = img_tag["src"]
             img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}" if not img_src.startswith("http") else img_src
         else:
             img_url = url
-
-        # Próby pobrania obrazu
         for retry in range(3):
             try:
                 response = requests.get(img_url, headers=headers, stream=False, timeout=15, allow_redirects=True)
                 response.raise_for_status()
-                
                 content_type = response.headers.get("Content-Type", "")
                 if not content_type.startswith("image/") and retry < 2:
                     continue
-                
-                # Zapisz obraz
                 extension = {
                     "image/jpeg": ".jpg", "image/png": ".png",
                     "image/gif": ".gif", "image/webp": ".webp"
                 }.get(content_type, ".jpg")
-                
                 filename = f"image_{uuid.uuid4().hex}{extension}"
                 file_path = os.path.join(temp_dir, filename)
-                
                 with open(file_path, "wb") as f:
                     f.write(response.content)
-                
                 if os.path.exists(file_path) and os.path.getsize(file_path) > 100:
                     return {"path": file_path, "filename": filename, "original_url": url}, None
                 else:
                     return None, "Pobrano pusty lub niepełny plik"
-                    
             except Exception as e:
                 if retry == 2:
                     return None, f"Błąd przy pobieraniu: {str(e)}"
-    
     except Exception as e:
         return None, f"Błąd: {str(e)}"
 
-def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debug_container=None):
+def process_images_sequentially(urls, temp_dir, ftp_settings, debug_container=None):
     new_urls_map = {}
     downloaded_images = []
     failed_urls = []
-    
-    def process_single_url(url):
-        try:
-            image_info, error = download_image(url, temp_dir)
-            if error:
-                return {"status": "download_error", "url": url, "error": error}
-                
-            ftp_manager = FTPManager(ftp_settings)
-            if not ftp_manager.connect():
-                return {"status": "ftp_connection_error", "url": url, "error": "Nie można połączyć się z serwerem FTP"}
-                
-            upload_result = ftp_manager.upload_file(image_info["path"])
-            ftp_manager.close()
-            
-            if upload_result["success"]:
-                return {
-                    "status": "success", "url": url, "ftp_url": upload_result["url"],
-                    "filename": upload_result["filename"], "path": image_info["path"]
-                }
-            else:
-                return {"status": "upload_error", "url": url, "error": upload_result["error"]}
-        except Exception as e:
-            return {"status": "error", "url": url, "error": str(e)}
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_single_url, url): url for url in urls}
-        
-        for future in concurrent.futures.as_completed(futures):
-            url = futures[future]
-            try:
-                result = future.result()
-                
-                if result["status"] == "success":
-                    new_urls_map[url] = result["ftp_url"]
-                    downloaded_images.append({
-                        "original_url": url, "ftp_url": result["ftp_url"],
-                        "filename": result["filename"]
-                    })
-                    if debug_container:
-                        debug_container.success(f"Pobrano i przesłano: {url}")
-                else:
-                    failed_urls.append({"url": url, "error": result.get("error", "Nieznany błąd")})
-                    if debug_container:
-                        debug_container.warning(f"Błąd dla {url}: {result.get('error')}")
-            except Exception as e:
-                failed_urls.append({"url": url, "error": str(e)})
-                if debug_container:
-                    debug_container.error(f"Wyjątek dla {url}: {str(e)}")
-    
+    ftp_manager = FTPManager(ftp_settings)
+    for url in urls:
+        image_info, error = download_image(url, temp_dir)
+        if error:
+            failed_urls.append({"url": url, "error": error})
+            if debug_container:
+                debug_container.warning(f"Błąd pobierania {url}: {error}")
+            continue
+        if not ftp_manager.connect():
+            failed_urls.append({"url": url, "error": "FTP error"})
+            if debug_container:
+                debug_container.warning(f"FTP error: {url}")
+            continue
+        upload_result = ftp_manager.upload_file(image_info["path"])
+        if upload_result["success"]:
+            new_urls_map[url] = upload_result["url"]
+            downloaded_images.append({
+                "original_url": url, "ftp_url": upload_result["url"],
+                "filename": upload_result["filename"]
+            })
+            if debug_container:
+                debug_container.success(f"Pobrano i przesłano: {url}")
+        else:
+            failed_urls.append({"url": url, "error": upload_result["error"]})
+            if debug_container:
+                debug_container.warning(f"Błąd uploadu {url}: {upload_result['error']}")
+    ftp_manager.close()
     return new_urls_map, downloaded_images, failed_urls
 
 def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
     try:
         if not xml_content or not xml_content.strip():
             return None, "Plik XML jest pusty"
-
-        # Oczyść dane wejściowe
         if xml_content.startswith("\ufeff"):
             xml_content = xml_content[1:]
         xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
-
-        # Obsługa atrybutów
         is_attribute = '/@' in xpath_expression
         attribute_name = xpath_expression.split('/@')[-1] if is_attribute else None
         xpath_base = xpath_expression.split('/@')[0] if is_attribute else xpath_expression
-
-        # Wyrażenia regularne dla najczęstszych przypadków
         if xpath_base in ["//product/image", "product/image"]:
             try:
                 pattern_simple = re.compile(r'<image>(.*?)</image>', re.DOTALL)
                 pattern_cdata = re.compile(r'<image><!\[CDATA\[(.*?)\]\]></image>', re.DOTALL)
-                
                 matches = pattern_simple.findall(xml_content) + pattern_cdata.findall(xml_content)
                 urls = []
                 for match in matches:
@@ -349,13 +278,10 @@ def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
                 return urls, None
             except Exception as e:
                 return None, f"Błąd przy parsowaniu XML: {str(e)}"
-
-        # ElementTree dla innych przypadków
         try:
             root = ET.fromstring(xml_content)
             xpath = f"./{xpath_base[2:]}" if xpath_base.startswith('//') else f"./{xpath_base}" if not xpath_base.startswith('./') else xpath_base
             elements = root.findall(xpath)
-
             urls = []
             for element in elements:
                 element_text = element.attrib.get(attribute_name) if is_attribute else element.text
@@ -370,7 +296,6 @@ def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
             return urls, None
         except ET.ParseError as e:
             return None, f"Błąd przy parsowaniu XML: {str(e)}"
-
     except Exception as e:
         return None, f"Nieoczekiwany błąd: {str(e)}"
 
@@ -378,20 +303,13 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
     try:
         if not xml_content.strip() or not new_node_name.strip():
             return None, "Plik XML jest pusty lub nazwa węzła jest pusta"
-
-        # Obsługa atrybutów
         is_attribute = '/@' in xpath_expression
         attribute_name = xpath_expression.split('/@')[-1] if is_attribute else None
         xpath_base = xpath_expression.split('/@')[0] if is_attribute else xpath_expression
-
         root = ET.fromstring(xml_content)
         xpath = xpath_base[2:] if xpath_base.startswith('//') else xpath_base
         elements = root.findall(f'.//{xpath}')
-        
-        # Mapa rodzic-dziecko dla szybkiego odnajdywania
         parent_map = {c: p for p in root.iter() for c in p}
-        
-        # Mapa rodzic-elementy do przetworzenia
         parent_to_elements = {}
         for element in elements:
             parent = parent_map.get(element)
@@ -400,10 +318,7 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
             if parent not in parent_to_elements:
                 parent_to_elements[parent] = []
             parent_to_elements[parent].append(element)
-        
-        # Przetwarzanie elementów
         for parent, elements_list in parent_to_elements.items():
-            # Znajdź lub utwórz węzeł ftp_images
             ftp_images = None
             for child in parent:
                 if child.tag == "ftp_images":
@@ -412,15 +327,10 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
             if ftp_images is None:
                 ftp_images = ET.Element("ftp_images")
                 parent.append(ftp_images)
-            
-            # Przetwarzanie elementów
             for element in elements_list:
-                # Pobierz oryginalny URL
                 original_url = element.attrib.get(attribute_name, "").strip() if is_attribute else (element.text.strip() if element.text else "")
                 if not original_url:
                     continue
-                
-                # Obsługa wielu URL-i w jednym elemencie
                 if separator in original_url:
                     urls = [url.strip() for url in original_url.split(separator)]
                     new_urls = [new_urls_map[url] for url in urls if url in new_urls_map]
@@ -428,12 +338,10 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
                         ftp_node = ET.Element(new_node_name)
                         ftp_node.text = separator.join(new_urls)
                         ftp_images.append(ftp_node)
-                # Obsługa pojedynczego URL-a
                 elif original_url in new_urls_map:
                     ftp_node = ET.Element(new_node_name)
                     ftp_node.text = new_urls_map[original_url]
                     ftp_images.append(ftp_node)
-
         return ET.tostring(root, encoding="unicode"), None
     except Exception as e:
         return None, f"Błąd przy aktualizacji XML: {str(e)}"
@@ -443,7 +351,6 @@ def extract_image_urls_from_csv(csv_content, column_name, separator=","):
         df = pd.read_csv(io.StringIO(csv_content))
         if column_name not in df.columns:
             return None, f"Kolumna '{column_name}' nie istnieje w pliku CSV."
-
         urls = []
         for value in df[column_name]:
             if pd.notna(value):
@@ -451,7 +358,6 @@ def extract_image_urls_from_csv(csv_content, column_name, separator=","):
                     urls.extend([url.strip() for url in str(value).split(separator) if url.strip()])
                 else:
                     urls.append(str(value).strip())
-
         return urls, None
     except Exception as e:
         return None, f"Błąd przy parsowaniu CSV: {str(e)}"
@@ -460,34 +366,26 @@ def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_
     try:
         if not new_column_name.strip():
             return None, "Nazwa nowej kolumny nie może być pusta"
-
         df = pd.read_csv(io.StringIO(csv_content))
         if column_name not in df.columns:
             return None, f"Kolumna '{column_name}' nie istnieje w pliku CSV."
-
         if new_column_name not in df.columns:
             df[new_column_name] = ""
-
         for idx, value in enumerate(df[column_name]):
             if pd.notna(value):
                 value_str = str(value).strip()
-                
-                # Obsługa wielu URL-i
                 if separator in value_str:
                     urls = [url.strip() for url in value_str.split(separator)]
                     new_urls = [new_urls_map[url] for url in urls if url in new_urls_map]
                     if new_urls:
                         df.at[idx, new_column_name] = separator.join(new_urls)
-                # Obsługa pojedynczego URL-a
                 elif value_str in new_urls_map:
                     df.at[idx, new_column_name] = new_urls_map[value_str]
                 else:
-                    # Próba dopasowania bez białych znaków
                     for key in new_urls_map:
                         if value_str.replace(" ", "") == key.replace(" ", ""):
                             df.at[idx, new_column_name] = new_urls_map[key]
                             break
-
         return df.to_csv(index=False), None
     except Exception as e:
         return None, f"Błąd przy aktualizacji CSV: {str(e)}"
@@ -496,39 +394,27 @@ def save_to_google_drive(output_bytes, file_info, new_urls_map=None):
     try:
         drive_folder_id = st.secrets.get("GOOGLE_DRIVE_FOLDER_ID")
         credentials_json = st.secrets.get("GOOGLE_DRIVE_CREDENTIALS_JSON")
-        
         if not drive_folder_id or not credentials_json:
             return False, "Brak konfiguracji Google Drive."
-
         now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         log_filename = f"image_urls_map_{now}.txt"
         result_filename = f"processed_{now}.{file_info['type']}"
-        
         with tempfile.TemporaryDirectory() as tmpdirname:
-            # Zapisz pliki tymczasowo
             temp_result_path = os.path.join(tmpdirname, f"output.{file_info['type']}")
             temp_log_path = os.path.join(tmpdirname, "log.txt")
-            
             with open(temp_result_path, "wb") as f:
                 f.write(output_bytes)
-                
-            # Przygotuj log
             log_content = f"# Raport z przetwarzania obrazów - {now}\n\n## Informacje o pliku\n"
             log_content += f"- Nazwa pliku: {file_info['name']}\n- Typ pliku: {file_info['type'].upper()}\n"
             log_content += f"- Kodowanie: {file_info['encoding']}\n\n## Mapowanie URL-i obrazów\n\n"
-            
             if new_urls_map:
                 for i, (original_url, new_url) in enumerate(new_urls_map.items(), 1):
                     log_content += f"### Obraz #{i}\n- Oryginalny URL: {original_url}\n- Nowy URL: {new_url}\n\n"
             else:
                 log_content += "Brak mapowania URL-i\n"
-                
             with open(temp_log_path, "w", encoding='utf-8') as f:
                 f.write(log_content)
-            
-            # Uwierzytelnianie Google Drive
             with st.spinner("Zapisuję na Google Drive..."):
-                # Przygotuj poświadczenia
                 if isinstance(credentials_json, str):
                     try:
                         creds_dict = json.loads(credentials_json)
@@ -536,16 +422,12 @@ def save_to_google_drive(output_bytes, file_info, new_urls_map=None):
                         return False, "Błąd dekodowania JSON z credentials"
                 else:
                     creds_dict = credentials_json
-                
                 scope = ["https://www.googleapis.com/auth/drive"]
                 credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-                
                 gauth = GoogleAuth()
                 gauth.credentials = credentials
                 drive = GoogleDrive(gauth)
-                
                 try:
-                    # Prześlij pliki
                     log_file = drive.CreateFile({
                         "title": log_filename, 
                         "parents": [{"id": drive_folder_id}],
@@ -553,7 +435,6 @@ def save_to_google_drive(output_bytes, file_info, new_urls_map=None):
                     })
                     log_file.SetContentFile(temp_log_path)
                     log_file.Upload()
-                    
                     result_file = drive.CreateFile({
                         "title": result_filename, 
                         "parents": [{"id": drive_folder_id}],
@@ -561,15 +442,13 @@ def save_to_google_drive(output_bytes, file_info, new_urls_map=None):
                     })
                     result_file.SetContentFile(temp_result_path)
                     result_file.Upload()
-                    
                     return True, "Pliki zostały zapisane na Google Drive."
                 except Exception as e:
                     return False, f"Błąd podczas wysyłania: {str(e)}"
     except Exception as e:
         return False, f"Błąd Google Drive: {str(e)}"
 
-# Funkcje zarządzania stanem
-def save_processing_state(session_id, urls, processed_urls, new_urls_map, file_info, processing_params):
+def save_processing_state(session_id, urls, processed_urls, new_urls_map, file_info, processing_params, failed_urls):
     state = {
         "session_id": session_id,
         "timestamp": datetime.now().isoformat(),
@@ -578,36 +457,35 @@ def save_processing_state(session_id, urls, processed_urls, new_urls_map, file_i
         "total_urls": len(urls),
         "processed_urls": processed_urls,
         "new_urls_map": new_urls_map,
-        "remaining_urls": [url for url in urls if url not in processed_urls],
+        "remaining_urls": [url for url in urls if url not in processed_urls and url not in new_urls_map],
+        "failed_urls": failed_urls,
         "file_content": file_info.get("content", "")
     }
-    
     state_dir = os.path.join(os.path.expanduser("~"), ".xml_image_processor")
     os.makedirs(state_dir, exist_ok=True)
     state_file = os.path.join(state_dir, f"session_{session_id}.json")
-    
     with open(state_file, "w") as f:
         json.dump(state, f)
-    
+    fail_log_path = os.path.join(state_dir, f"fail_log_{session_id}.csv")
+    with open(fail_log_path, "w", encoding="utf-8") as f:
+        f.write("url,error\n")
+        for fail in failed_urls:
+            f.write(f"{fail['url']},{fail.get('error','')}\n")
     return state_file
 
 def load_processing_state(session_id=None):
     state_dir = os.path.join(os.path.expanduser("~"), ".xml_image_processor")
     if not os.path.exists(state_dir):
         return None
-    
     if session_id:
         state_file = os.path.join(state_dir, f"session_{session_id}.json")
         if os.path.exists(state_file):
             with open(state_file, "r") as f:
                 return json.load(f)
         return None
-    
-    # Znajdź najnowszy plik
     state_files = [f for f in os.listdir(state_dir) if f.startswith("session_") and f.endswith(".json")]
     if not state_files:
         return None
-    
     state_files.sort(key=lambda x: os.path.getmtime(os.path.join(state_dir, x)), reverse=True)
     with open(os.path.join(state_dir, state_files[0]), "r") as f:
         return json.load(f)
@@ -616,7 +494,6 @@ def list_saved_sessions():
     state_dir = os.path.join(os.path.expanduser("~"), ".xml_image_processor")
     if not os.path.exists(state_dir):
         return []
-    
     sessions = []
     for filename in os.listdir(state_dir):
         if filename.startswith("session_") and filename.endswith(".json"):
@@ -633,81 +510,62 @@ def list_saved_sessions():
                     })
             except:
                 pass
-    
     sessions.sort(key=lambda x: x["timestamp"], reverse=True)
     return sessions
 
-def resume_processing(state, temp_dir, ftp_settings, max_workers=5):
-    remaining_urls = state["remaining_urls"]
+def resume_processing(state, temp_dir, ftp_settings):
+    remaining_urls = state["failed_urls"] + [url for url in state["remaining_urls"] if url not in state["failed_urls"]]
     new_urls_map = state.get("new_urls_map", {})
     file_info = state["file_info"]
     processing_params = state["processing_params"]
     session_id = state["session_id"]
-    
     if not remaining_urls:
         st.success("Wszystkie URL-e zostały już przetworzone.")
         return True
-    
     progress_bar = st.progress(len(state["processed_urls"]) / state["total_urls"])
     status_text = st.empty()
     debug_area = st.empty()
-    
     status_text.text(f"Wznawianie przetwarzania {len(state['processed_urls'])+1}-{state['total_urls']} z {state['total_urls']}...")
-    
     processed_urls = state.get("processed_urls", [])
     batch_size = min(10, len(remaining_urls))
-    
     all_downloaded = []
-    
+    failed_urls = state.get("failed_urls", [])
     for i in range(0, len(remaining_urls), batch_size):
-        batch_urls = remaining_urls[i:i+batch_size]
-        
+        batch_urls = [u for u in remaining_urls[i:i+batch_size] if u not in processed_urls and u not in new_urls_map]
         status_text.text(f"Przetwarzanie {len(processed_urls)+i+1}-{len(processed_urls)+min(i+batch_size, len(remaining_urls))} z {state['total_urls']}...")
         progress_value = (len(processed_urls) + i) / state["total_urls"]
         progress_bar.progress(progress_value)
-        
-        # Przetwarzanie równoległe
-        batch_result, batch_downloaded, _ = process_images_in_parallel(
+        batch_result, batch_downloaded, batch_failed = process_images_sequentially(
             batch_urls, 
             temp_dir, 
             ftp_settings,
-            max_workers=max_workers,
             debug_container=debug_area
         )
-        
-        # Aktualizacja stanu
         new_urls_map.update(batch_result)
         processed_urls.extend(batch_urls)
         all_downloaded.extend(batch_downloaded)
-        
-        # Zapisz stan po każdej paczce
+        failed_urls.extend(batch_failed)
         save_processing_state(
             session_id, 
             state["remaining_urls"] + state["processed_urls"], 
             processed_urls, 
             new_urls_map, 
             file_info,
-            processing_params
+            processing_params,
+            failed_urls
         )
-    
     progress_bar.progress(1.0)
     status_text.text(f"Zakończono wznowione przetwarzanie. Pobrano i przesłano {len(all_downloaded)} obrazów.")
-    
-    # Aktualizacja pliku po wszystkich pobraniach
     if new_urls_map:
         file_type = file_info["type"]
         file_content = state.get("file_content", "")
-        
         if not file_content:
             st.error("Brak treści pliku w zapisanym stanie - nie można zaktualizować pliku.")
             return False
-        
-        # Aktualizacja odpowiedniego typu pliku
         if file_type == "xml":
             xpath = processing_params.get("xpath", "")
             new_node_name = processing_params.get("new_node_name", "ftp")
             separator = processing_params.get("separator", ",")
-            
             updated_content, error = update_xml_with_new_urls(
                 file_content, xpath, new_urls_map, new_node_name, separator
             )
@@ -715,26 +573,19 @@ def resume_processing(state, temp_dir, ftp_settings, max_workers=5):
             column_name = processing_params.get("column_name", "")
             new_column_name = processing_params.get("new_column_name", "ftp_url")
             separator = processing_params.get("separator", ",")
-            
             updated_content, error = update_csv_with_new_urls(
                 file_content, column_name, new_urls_map, new_column_name, separator
             )
-        
         if error:
             st.error(f"Błąd podczas aktualizacji pliku: {error}")
             return False
-        
         output_bytes = updated_content.encode(file_info["encoding"])
         st.success("Plik został pomyślnie zaktualizowany!")
-        
-        # Google Drive
         try:
             success, message = save_to_google_drive(output_bytes, file_info, new_urls_map)
             st.success(f"✅ {message}") if success else st.warning(f"⚠️ {message}")
         except Exception as e:
             st.error(f"Błąd Google Drive: {str(e)}")
-        
-        # Przycisk pobierania
         base_name = os.path.splitext(file_info["name"])[0]
         st.download_button(
             label=f"📁 Pobierz zaktualizowany plik",
@@ -742,6 +593,16 @@ def resume_processing(state, temp_dir, ftp_settings, max_workers=5):
             file_name=f"{base_name}_updated.{file_type}",
             mime="text/plain"
         )
+        state_dir = os.path.join(os.path.expanduser("~"), ".xml_image_processor")
+        fail_log_path = os.path.join(state_dir, f"fail_log_{session_id}.csv")
+        if os.path.exists(fail_log_path):
+            with open(fail_log_path, "rb") as f:
+                st.download_button(
+                    label="📄 Pobierz log błędów",
+                    data=f.read(),
+                    file_name=f"fail_log_{session_id}.csv",
+                    mime="text/csv"
+                )
         return True
     else:
         st.warning("Nie udało się przetworzyć żadnych nowych obrazów.")
@@ -758,20 +619,15 @@ def main():
     st.set_page_config(page_title="Pobieranie zdjęć z XML/CSV", layout="centered")
     authenticate_user()
     initialize_session_state()
-
     st.title("Pobieranie zdjęć z XML/CSV")
-
     tab1, tab2, tab3 = st.tabs(["Pobieranie zdjęć", "Wznów przetwarzanie", "Pomoc"])
-
     with tab1:
         st.markdown("""
         To narzędzie umożliwia pobieranie zdjęć z plików XML lub CSV i zapisywanie ich na serwerze FTP.
         Prześlij plik, wskaż lokalizację linków do zdjęć, podaj dane FTP i pobierz zdjęcia.
         """)
-
         st.subheader("1. Wczytaj plik źródłowy")
         uploaded_file = st.file_uploader("Wgraj plik XML lub CSV", type=["xml", "csv"])
-
         if uploaded_file:
             file_info, error = read_file_content(uploaded_file)
             if error:
@@ -779,12 +635,9 @@ def main():
             else:
                 st.success(f"Wczytano plik: {file_info['name']} ({file_info['type'].upper()}, {file_info['encoding']})")
                 st.session_state.file_info = file_info
-
         st.subheader("2. Konfiguracja pobierania zdjęć")
-
         if st.session_state.file_info:
             file_type = st.session_state.file_info["type"]
-
             if file_type == "xml":
                 xpath = st.text_input("XPath do węzła zawierającego URL-e zdjęć", 
                                     placeholder="Np. //product/image lub //image/@url")
@@ -799,12 +652,9 @@ def main():
                                               placeholder="Np. ftp_image_url")
                 st.session_state.processing_params["column_name"] = column_name
                 st.session_state.processing_params["new_column_name"] = new_column_name
-
             separator = st.text_input("Separator URL-i (jeśli w jednej komórce/węźle jest wiele linków)", value=",")
             st.session_state.processing_params["separator"] = separator
-
         st.subheader("3. Konfiguracja serwera FTP")
-
         col1, col2 = st.columns(2)
         with col1:
             st.session_state.ftp_settings["host"] = st.text_input("Adres serwera FTP", 
@@ -816,105 +666,79 @@ def main():
             st.session_state.ftp_settings["http_path"] = st.text_input("Ścieżka HTTP do zdjęć",
                                                                       value=st.session_state.ftp_settings.get("http_path", ""),
                                                                       placeholder="https://example.com/images/")
-
         with col2:
             st.session_state.ftp_settings["username"] = st.text_input("Nazwa użytkownika", 
                                                                      value=st.session_state.ftp_settings["username"])
             st.session_state.ftp_settings["password"] = st.text_input("Hasło", type="password", 
                                                                      value=st.session_state.ftp_settings["password"])
-
         st.subheader("4. Pobierz zdjęcia i prześlij na FTP")
-        
         if st.session_state.file_info:
-            max_workers = st.slider("Liczba równoległych procesów pobierania", min_value=1, max_value=10, value=3, 
-                                   help="Wyższa wartość przyspieszy pobieranie, ale może obciążyć łącze")
-
+            max_workers = 1
         if st.session_state.file_info and st.button("Pobierz zdjęcia i prześlij na FTP"):
             file_type = st.session_state.file_info["type"]
             file_content = st.session_state.file_info["content"]
-
-            # Walidacja wejść
-            if file_type == "xml" and (not xpath or not xpath.strip() or not new_node_name or not new_node_name.strip()):
-                st.error("Podaj prawidłowy XPath i nazwę nowego węzła!")
-                st.stop()
-            elif file_type == "csv" and (not column_name or not column_name.strip() or not new_column_name or not new_column_name.strip()):
-                st.error("Podaj prawidłową nazwę kolumny i nazwę nowej kolumny!")
-                st.stop()
-
-            # Ekstrakcja URL-i
-            if file_type == "xml" and xpath:
+            if file_type == "xml":
+                xpath = st.session_state.processing_params.get("xpath", "")
+                new_node_name = st.session_state.processing_params.get("new_node_name", "")
+                separator = st.session_state.processing_params.get("separator", ",")
+                if not xpath or not xpath.strip() or not new_node_name or not new_node_name.strip():
+                    st.error("Podaj prawidłowy XPath i nazwę nowego węzła!")
+                    st.stop()
                 urls, error = extract_image_urls_from_xml(file_content, xpath, separator)
-            elif file_type == "csv" and column_name:
+            elif file_type == "csv":
+                column_name = st.session_state.processing_params.get("column_name", "")
+                new_column_name = st.session_state.processing_params.get("new_column_name", "")
+                separator = st.session_state.processing_params.get("separator", ",")
+                if not column_name or not column_name.strip() or not new_column_name or not new_column_name.strip():
+                    st.error("Podaj prawidłową nazwę kolumny i nazwę nowej kolumny!")
+                    st.stop()
                 urls, error = extract_image_urls_from_csv(file_content, column_name, separator)
             else:
                 urls, error = None, "Nie podano ścieżki XPath lub nazwy kolumny."
-
             if error:
                 st.error(error)
             elif not urls:
                 st.warning("Nie znaleziono żadnych URL-i zdjęć.")
             else:
                 st.success(f"Znaleziono {len(urls)} URL-i zdjęć")
-
                 with st.expander("Podgląd znalezionych URL-i"):
                     for i, url in enumerate(urls[:5]):
                         st.write(f"{i+1}. {url}")
                     if len(urls) > 5:
                         st.write(f"... oraz {len(urls)-5} więcej.")
-
                 if not st.session_state.ftp_settings["host"] or not st.session_state.ftp_settings["username"]:
                     st.error("Podaj dane serwera FTP.")
                 else:
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     debug_area = st.empty()
-                    
-                    # Sesja przetwarzania
                     session_id = f"{uuid.uuid4().hex}_{int(time.time())}"
-                    
                     with tempfile.TemporaryDirectory() as tmpdirname:
                         processed_urls = []
                         new_urls_map = {}
-                        
-                        # Przetwarzanie w paczkach
+                        failed_urls = []
                         batch_size = 10
-                        
                         for i in range(0, len(urls), batch_size):
-                            batch_urls = urls[i:i+batch_size]
-                            
+                            batch_urls = [u for u in urls[i:i+batch_size] if u not in processed_urls and u not in new_urls_map]
                             status_text.text(f"Przetwarzanie obrazów {i+1}-{min(i+batch_size, len(urls))} z {len(urls)}...")
                             progress_bar.progress(i / len(urls))
-                            
-                            # Przetwarzanie równoległe
-                            batch_result, _, batch_failed = process_images_in_parallel(
+                            batch_result, _, batch_failed = process_images_sequentially(
                                 batch_urls, 
                                 tmpdirname, 
                                 st.session_state.ftp_settings,
-                                max_workers=max_workers,
                                 debug_container=debug_area
                             )
-                            
-                            # Aktualizacja stanu
                             new_urls_map.update(batch_result)
                             processed_urls.extend(batch_urls)
-                            
-                            # Zapisz stan
+                            failed_urls.extend(batch_failed)
                             save_processing_state(
                                 session_id, urls, processed_urls, new_urls_map, 
-                                st.session_state.file_info, st.session_state.processing_params
+                                st.session_state.file_info, st.session_state.processing_params,
+                                failed_urls
                             )
-                            
-                            # Wyświetl błędy
-                            for fail in batch_failed:
-                                debug_area.warning(f"Nie udało się przetworzyć: {fail['url']} - {fail['error']}")
-                        
-                        # Zakończenie przetwarzania
                         progress_bar.progress(1.0)
                         status_text.text(f"Zakończono przetwarzanie. Pobrano i przesłano {len(new_urls_map)} z {len(urls)} obrazów.")
-                        
-                        # Aktualizacja pliku
                         if new_urls_map:
-                            # Wybór odpowiedniej funkcji aktualizacji
                             if file_type == "xml":
                                 updated_content, error = update_xml_with_new_urls(
                                     file_content, xpath, new_urls_map, new_node_name, separator
@@ -923,33 +747,25 @@ def main():
                                 updated_content, error = update_csv_with_new_urls(
                                     file_content, column_name, new_urls_map, new_column_name, separator
                                 )
-
                             if error:
                                 st.error(f"Błąd podczas aktualizacji pliku: {error}")
                             else:
-                                # Kodowanie wyniku
                                 st.session_state.output_bytes = updated_content.encode(
                                     st.session_state.file_info["encoding"]
                                 )
                                 st.success("Plik został zaktualizowany o nowe linki FTP.")
-                                
-                                # Google Drive
                                 try:
                                     success, message = save_to_google_drive(
                                         st.session_state.output_bytes,
                                         st.session_state.file_info,
                                         new_urls_map
                                     )
-                                    
                                     if success:
                                         st.success(f"✅ {message}")
                                     else:
                                         st.warning(f"⚠️ {message}")
-                                
                                 except Exception as e:
                                     st.error(f"Błąd Google Drive: {str(e)}")
-
-                                # Przycisk pobierania
                                 original_name = st.session_state.file_info["name"]
                                 base_name = os.path.splitext(original_name)[0]
                                 st.download_button(
@@ -958,41 +774,40 @@ def main():
                                     file_name=f"{base_name}_updated.{file_type}",
                                     mime="text/plain"
                                 )
-
+                                state_dir = os.path.join(os.path.expanduser("~"), ".xml_image_processor")
+                                fail_log_path = os.path.join(state_dir, f"fail_log_{session_id}.csv")
+                                if os.path.exists(fail_log_path):
+                                    with open(fail_log_path, "rb") as f:
+                                        st.download_button(
+                                            label="📄 Pobierz log błędów",
+                                            data=f.read(),
+                                            file_name=f"fail_log_{session_id}.csv",
+                                            mime="text/csv"
+                                        )
                         if st.button("Rozpocznij nową operację"):
                             reset_app_state()
-
     with tab2:
         st.subheader("Wznów wcześniej przerwane przetwarzanie")
-        
         saved_sessions = list_saved_sessions()
         if not saved_sessions:
             st.info("Nie znaleziono zapisanych sesji przetwarzania.")
         else:
             st.write("Wybierz sesję do wznowienia:")
-            
-            # Tabela sesji
             sessions_df = pd.DataFrame(saved_sessions)
             if not sessions_df.empty:
                 st.dataframe(sessions_df[["timestamp", "file_info", "progress", "percentage"]])
-                
-                # Wybór sesji
                 selected_session_id = st.selectbox(
                     "Wybierz ID sesji do wznowienia:", 
                     options=[s["session_id"] for s in saved_sessions],
                     format_func=lambda x: f"{next((s['timestamp'] for s in saved_sessions if s['session_id'] == x), '')} - {next((s['file_info'] for s in saved_sessions if s['session_id'] == x), '')}"
                 )
-                
-                max_workers_resume = st.slider("Liczba równoległych procesów", min_value=1, max_value=10, value=3)
-                
                 if st.button("Wznów przetwarzanie"):
                     state = load_processing_state(selected_session_id)
                     if state:
                         with tempfile.TemporaryDirectory() as tmpdirname:
-                            resume_processing(state, tmpdirname, st.session_state.ftp_settings, max_workers=max_workers_resume)
+                            resume_processing(state, tmpdirname, st.session_state.ftp_settings)
                     else:
                         st.error("Nie udało się załadować stanu sesji.")
-
     with tab3:
         st.markdown("""
         ### Jak korzystać z aplikacji
