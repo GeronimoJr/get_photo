@@ -238,7 +238,7 @@ class FTPConnectionPool:
     def get_connection(self):
         with self.lock:
             if not self.connections:
-                return FTPManager.get_instance(st.session_state.ftp_settings)
+                return self._manager
             return self.connections.pop()
     def release_connection(self, connection):
         with self.lock:
@@ -268,13 +268,14 @@ class FTPBatchManager:
         self.max_workers = max_workers
         self.batch_size = calculate_batch_size(max_workers * 10, max_workers)
         self.connection_pool = FTPConnectionPool(max_workers)
+        self.ftp_manager = FTPManager.get_instance(settings)
+        self.connection_pool._manager = self.ftp_manager
         self.upload_queue = queue.Queue()
         self.results = {}
         self.running = False
         self.worker_thread = None
         self.lock = threading.Lock()
         self.semaphore = threading.Semaphore(max_workers)
-        self.ftp_manager = FTPManager.get_instance(settings)
         self.stats = {
             'total_uploaded': 0,
             'failed_uploads': 0,
