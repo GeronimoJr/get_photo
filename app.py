@@ -22,6 +22,7 @@ import concurrent.futures
 import queue
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 # Stałe konfiguracyjne
 FTP_CONFIG = {
@@ -252,6 +253,37 @@ class FTPManager:
     def __del__(self):
         self.close()
 
+class FTPConnectionPool:
+    def __init__(self, max_connections=5):
+        self.pool = ThreadPoolExecutor(max_workers=max_connections)
+        self.connections = []
+        self.lock = threading.Lock()
+        
+    def get_connection(self):
+        with self.lock:
+            if not self.connections:
+                return FTPManager.get_instance(st.session_state.ftp_settings)
+            return self.connections.pop()
+            
+    def release_connection(self, connection):
+        with self.lock:
+            self.connections.append(connection)
+            
+    def close_all(self):
+        with self.lock:
+            for conn in self.connections:
+                try:
+                    conn.close()
+                except:
+                    pass
+            self.connections.clear()
+
+def calculate_batch_size(total_urls, max_workers):
+    return min(
+        max(FTP_CONFIG['MIN_BATCH_SIZE'], total_urls // 10),
+        max_workers * 2
+    )
+
 class FTPBatchManager:
     """
     Manager do wykonywania operacji FTP w batchach,
@@ -260,17 +292,15 @@ class FTPBatchManager:
     
     def __init__(self, settings, max_workers):
         self.settings = settings
-        # Oblicz parametry na podstawie max_workers
-        self.batch_size = max(FTP_CONFIG['MIN_BATCH_SIZE'], 
-                            min(FTP_CONFIG['MAX_BATCH_SIZE'], max_workers * 2))
-        self.max_connections = max(FTP_CONFIG['MIN_CONNECTIONS'], 
-                                 min(FTP_CONFIG['MAX_CONNECTIONS'], max_workers))
+        self.max_workers = max_workers
+        self.batch_size = calculate_batch_size(max_workers * 10, max_workers)
+        self.connection_pool = FTPConnectionPool(max_workers)
         self.upload_queue = queue.Queue()
         self.results = {}
         self.running = False
         self.worker_thread = None
         self.lock = threading.Lock()
-        self.semaphore = threading.Semaphore(self.max_connections)
+        self.semaphore = threading.Semaphore(max_workers)
         self.ftp_manager = FTPManager.get_instance(settings)
         self.stats = {
             'total_uploaded': 0,
@@ -326,7 +356,7 @@ class FTPBatchManager:
                 
                 time.sleep(random.uniform(0.1, 0.3))  # Zmniejszone opóźnienie między batchami
                 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_connections) as executor:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                     futures = {executor.submit(self._upload_file, task_id, file_path): (task_id, callback) 
                               for task_id, file_path, callback in batch}
                     
@@ -436,59 +466,63 @@ def initialize_session_state():
         if key not in st.session_state:
             st.session_state[key] = value
 
+def detect_encoding(raw_bytes):
+    """Wykrywa kodowanie pliku"""
+    # Sprawdź BOM
+    if raw_bytes.startswith(codecs.BOM_UTF16_LE):
+        return 'utf-16-le'
+    if raw_bytes.startswith(codecs.BOM_UTF16_BE):
+        return 'utf-16-be'
+    if raw_bytes.startswith(codecs.BOM_UTF8):
+        return 'utf-8'
+    
+    # Sprawdź deklarację XML
+    encoding_match = re.search(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', raw_bytes)
+    if encoding_match:
+        try:
+            return encoding_match.group(1).decode('ascii').lower()
+        except:
+            pass
+    
+    # Próbuj popularne kodowania
+    for enc in ["utf-8", "iso-8859-2", "windows-1250"]:
+        try:
+            raw_bytes.decode(enc)
+            return enc
+        except:
+            continue
+    
+    return 'utf-8'  # Domyślne kodowanie
+
 def read_file_content(uploaded_file):
     if not uploaded_file:
         return None, "Nie wybrano pliku"
-
+    
     try:
         raw_bytes = uploaded_file.read()
         file_type = uploaded_file.name.split(".")[-1].lower()
-
+        
         if file_type not in ["xml", "csv"]:
             return None, "Nieobsługiwany typ pliku. Akceptowane formaty to XML i CSV."
-
-        # Próba autodetekcji kodowania
-        if file_type == "xml":
-            # Sprawdź BOM UTF-16
-            if raw_bytes.startswith(codecs.BOM_UTF16_LE) or raw_bytes.startswith(codecs.BOM_UTF16_BE):
-                try:
-                    encoding = 'utf-16-le' if raw_bytes.startswith(codecs.BOM_UTF16_LE) else 'utf-16-be'
-                    return {"content": raw_bytes.decode(encoding), "raw_bytes": raw_bytes, 
-                            "type": file_type, "encoding": 'utf-16', "name": uploaded_file.name}, None
-                except UnicodeDecodeError:
-                    pass
-
-            # Sprawdź zadeklarowane kodowanie w XML
-            encoding_match = re.search(br'<\?xml[^>]*encoding=["\']([^"\']+)["\']', raw_bytes)
-            if encoding_match:
-                try:
-                    encoding = encoding_match.group(1).decode('ascii').lower()
-                    return {"content": raw_bytes.decode(encoding), "raw_bytes": raw_bytes, 
-                            "type": file_type, "encoding": encoding, "name": uploaded_file.name}, None
-                except:
-                    pass
-
-        # Próbuj różne kodowania
-        for enc in ["utf-8", "iso-8859-2", "windows-1250", "utf-16-le", "utf-16-be"]:
-            try:
-                return {"content": raw_bytes.decode(enc), "raw_bytes": raw_bytes, 
-                        "type": file_type, "encoding": enc, "name": uploaded_file.name}, None
-            except UnicodeDecodeError:
-                continue
-
-        # Specjalna obsługa dla CSV
+        
+        encoding = detect_encoding(raw_bytes)
+        content = raw_bytes.decode(encoding)
+        
         if file_type == "csv":
+            # Weryfikacja czy to poprawny CSV
             try:
-                buffer = io.BytesIO(raw_bytes)
-                df = pd.read_csv(buffer, sep=None, engine='python')
-                return {"content": df.to_csv(index=False), "raw_bytes": raw_bytes, 
-                        "type": file_type, "encoding": "auto-detected", 
-                        "name": uploaded_file.name, "dataframe": df}, None
+                pd.read_csv(io.StringIO(content))
             except:
-                pass
-
-        return None, "Nie udało się odczytać pliku – nieznane kodowanie."
-
+                return None, "Niepoprawny format CSV"
+        
+        return {
+            "content": content,
+            "raw_bytes": raw_bytes,
+            "type": file_type,
+            "encoding": encoding,
+            "name": uploaded_file.name
+        }, None
+        
     except Exception as e:
         return None, f"Błąd podczas odczytu pliku: {str(e)}"
 
@@ -639,7 +673,7 @@ def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, log_lis
                 "error": exception_details
             }
 
-def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, debug_container=None, max_retries=3, progress_callback=None):
+def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, debug_container=None, max_retries=3, progress_callback=None, session_id=None):
     # Użyj domyślnej wartości jeśli nie podano max_workers
     if max_workers is None:
         max_workers = FTP_CONFIG['DEFAULT_WORKERS']
@@ -655,7 +689,7 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
         debug_container.info(f"Konfiguracja przetwarzania:")
         debug_container.info(f"- Max równoległych procesów: {max_workers}")
         debug_container.info(f"- Rozmiar batcha: {ftp_batch_manager.batch_size}")
-        debug_container.info(f"- Max połączeń FTP: {ftp_batch_manager.max_connections}")
+        debug_container.info(f"- Max połączeń FTP: {ftp_batch_manager.max_workers}")
     
     # Weryfikacja połączenia FTP przed rozpoczęciem
     success, message = ftp_batch_manager.verify_connection()
@@ -805,6 +839,11 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
                 ): (url, retry_count) for url, retry_count in batch
             }
             
+            # --- Zmienna do liczenia ile zdjęć od ostatniej aktualizacji ---
+            images_since_update = 0
+            batch_size_total = len(futures)
+            batch_processed = 0
+            # ---
             for future in concurrent.futures.as_completed(futures):
                 url, retry_count = futures[future]
                 try:
@@ -832,18 +871,18 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
                         if debug_container:
                             debug_container.warning(f"❌ Błąd dla {url}: {result.get('error')}")
 
-                    # Aktualizacja postępu
+                    # --- Aktualizacja postępu co 10 zdjęć lub na końcu batcha ---
+                    batch_processed += 1
+                    images_since_update += 1
                     if progress_callback and total_urls > 0:
-                        remaining = total_urls - next_url_index + retry_queue.qsize() + len(ftp_tasks)
-                        progress = min(0.99, max(0.01, (total_urls - remaining) / total_urls))
-                        
-                        # Pobierz statystyki FTP
-                        stats = ftp_batch_manager.get_stats()
-                        upload_rate = stats.get('upload_rate', 0)
-                        
-                        # Aktualizuj progress z dodatkowymi informacjami
-                        progress_callback(progress, processed_count, stats['total_uploaded'], total_urls)
-                
+                        if images_since_update >= 10 or batch_processed == batch_size_total:
+                            remaining = total_urls - next_url_index + retry_queue.qsize() + len(ftp_tasks)
+                            progress = min(0.99, max(0.01, (total_urls - remaining) / total_urls))
+                            stats = ftp_batch_manager.get_stats()
+                            progress_callback(progress, processed_count, stats['total_uploaded'], total_urls)
+                            images_since_update = 0
+                            save_current_state()  # Zapisz stan co 10 obrazów
+                    # ---
                 except Exception as e:
                     failed_urls.append({"url": url, "error": str(e)})
                     processed_count += 1
@@ -869,96 +908,101 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
     
     return new_urls_map, downloaded_images, failed_urls
 
-def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
-    try:
-        if not xml_content or not xml_content.strip():
-            return None, "Plik XML jest pusty"
-
-        # Oczyść dane wejściowe
-        if xml_content.startswith("\ufeff"):
-            xml_content = xml_content[1:]
-        xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
-
-        # Obsługa atrybutów
-        is_attribute = '/@' in xpath_expression
-        attribute_name = xpath_expression.split('/@')[-1] if is_attribute else None
-        xpath_base = xpath_expression.split('/@')[0] if is_attribute else xpath_expression
-
-        # Wyrażenia regularne dla najczęstszych przypadków
-        if xpath_base in ["//product/image", "product/image", "//image", "/image"]:
-            try:
-                # Ulepszone wyrażenia regularne dla różnych formatów
-                pattern_simple = re.compile(r'<image>(.*?)</image>', re.DOTALL)
-                pattern_cdata = re.compile(r'<image><!\[CDATA\[(.*?)\]\]></image>', re.DOTALL)
-                pattern_with_attribs = re.compile(r'<image [^>]*?>(.*?)</image>', re.DOTALL)
-                
-                matches = pattern_simple.findall(xml_content) + pattern_cdata.findall(xml_content) + pattern_with_attribs.findall(xml_content)
-                
-                urls = []
-                for match in matches:
-                    match = match.strip()
-                    if not match:
-                        continue
-                    
-                    # Znajdź URL-e w treści
-                    url_pattern = re.compile(r'https?://[^\s<>"\']+')
-                    found_urls = url_pattern.findall(match)
-                    
-                    if found_urls:
-                        for url in found_urls:
-                            clean_url = url.replace('&amp;', '&')
-                            urls.append(clean_url)
-                    elif 'http://' in match or 'https://' in match:
-                        urls.append(match.replace('&amp;', '&'))
-                
-                if urls:
-                    return urls, None
-            except Exception as e:
-                return None, f"Błąd przy parsowaniu XML wyrażeniami regularnymi: {str(e)}"
-
-        # ElementTree dla innych przypadków
+def handle_errors(func):
+    def wrapper(*args, **kwargs):
         try:
-            # Próbuj naprawić częste problemy w XML
-            xml_content = re.sub(r'&(?!amp;|lt;|gt;|apos;|quot;)', '&amp;', xml_content)
-            
-            root = ET.fromstring(xml_content)
-            xpath = f"./{xpath_base[2:]}" if xpath_base.startswith('//') else f"./{xpath_base}" if not xpath_base.startswith('./') else xpath_base
-            elements = root.findall(xpath)
+            return func(*args, **kwargs)
+        except Exception as e:
+            return None, f"Błąd: {str(e)}"
+    return wrapper
 
+@handle_errors
+def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
+    if not xml_content or not xml_content.strip():
+        return None, "Plik XML jest pusty"
+    
+    # Oczyść dane wejściowe
+    if xml_content.startswith("\ufeff"):
+        xml_content = xml_content[1:]
+    xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
+    
+    # Obsługa atrybutów
+    is_attribute = '/@' in xpath_expression
+    attribute_name = xpath_expression.split('/@')[-1] if is_attribute else None
+    xpath_base = xpath_expression.split('/@')[0] if is_attribute else xpath_expression
+
+    # Wyrażenia regularne dla najczęstszych przypadków
+    if xpath_base in ["//product/image", "product/image", "//image", "/image"]:
+        try:
+            # Ulepszone wyrażenia regularne dla różnych formatów
+            pattern_simple = re.compile(r'<image>(.*?)</image>', re.DOTALL)
+            pattern_cdata = re.compile(r'<image><!\[CDATA\[(.*?)\]\]></image>', re.DOTALL)
+            pattern_with_attribs = re.compile(r'<image [^>]*?>(.*?)</image>', re.DOTALL)
+            
+            matches = pattern_simple.findall(xml_content) + pattern_cdata.findall(xml_content) + pattern_with_attribs.findall(xml_content)
+            
             urls = []
-            for element in elements:
-                element_text = element.attrib.get(attribute_name) if is_attribute else element.text
-                if element_text:
-                    element_text = element_text.replace('&amp;', '&')
-                    
-                    # Sprawdź, czy tekst zawiera URL-e
-                    if 'http://' in element_text or 'https://' in element_text:
-                        if separator in element_text:
-                            found_urls = [url.strip() for url in element_text.split(separator) 
-                                        if url.strip() and ('http://' in url or 'https://' in url)]
-                            urls.extend(found_urls)
-                        else:
-                            urls.append(element_text.strip())
+            for match in matches:
+                match = match.strip()
+                if not match:
+                    continue
+                
+                # Znajdź URL-e w treści
+                url_pattern = re.compile(r'https?://[^\s<>"\']+')
+                found_urls = url_pattern.findall(match)
+                
+                if found_urls:
+                    for url in found_urls:
+                        clean_url = url.replace('&amp;', '&')
+                        urls.append(clean_url)
+                elif 'http://' in match or 'https://' in match:
+                    urls.append(match.replace('&amp;', '&'))
             
-            # Jeśli nie znaleziono URL-i, spróbuj bardziej generyczne podejście
-            if not urls:
-                # Znajdź wszystkie elementy z tekstem zawierającym http
-                for elem in root.iter():
-                    if elem.text and ('http://' in elem.text or 'https://' in elem.text):
-                        element_text = elem.text.replace('&amp;', '&')
-                        if separator in element_text:
-                            found_urls = [url.strip() for url in element_text.split(separator) 
-                                        if url.strip() and ('http://' in url or 'https://' in url)]
-                            urls.extend(found_urls)
-                        else:
-                            urls.append(element_text.strip())
-            
-            return urls, None
-        except ET.ParseError as e:
-            return None, f"Błąd przy parsowaniu XML: {str(e)}"
+            if urls:
+                return urls, None
+        except Exception as e:
+            return None, f"Błąd przy parsowaniu XML wyrażeniami regularnymi: {str(e)}"
 
-    except Exception as e:
-        return None, f"Nieoczekiwany błąd: {str(e)}"
+    # ElementTree dla innych przypadków
+    try:
+        # Próbuj naprawić częste problemy w XML
+        xml_content = re.sub(r'&(?!amp;|lt;|gt;|apos;|quot;)', '&amp;', xml_content)
+        
+        root = ET.fromstring(xml_content)
+        xpath = f"./{xpath_base[2:]}" if xpath_base.startswith('//') else f"./{xpath_base}" if not xpath_base.startswith('./') else xpath_base
+        elements = root.findall(xpath)
+
+        urls = []
+        for element in elements:
+            element_text = element.attrib.get(attribute_name) if is_attribute else element.text
+            if element_text:
+                element_text = element_text.replace('&amp;', '&')
+                
+                # Sprawdź, czy tekst zawiera URL-e
+                if 'http://' in element_text or 'https://' in element_text:
+                    if separator in element_text:
+                        found_urls = [url.strip() for url in element_text.split(separator) 
+                                    if url.strip() and ('http://' in url or 'https://' in url)]
+                        urls.extend(found_urls)
+                    else:
+                        urls.append(element_text.strip())
+        
+        # Jeśli nie znaleziono URL-i, spróbuj bardziej generyczne podejście
+        if not urls:
+            # Znajdź wszystkie elementy z tekstem zawierającym http
+            for elem in root.iter():
+                if elem.text and ('http://' in elem.text or 'https://' in elem.text):
+                    element_text = elem.text.replace('&amp;', '&')
+                    if separator in element_text:
+                        found_urls = [url.strip() for url in element_text.split(separator) 
+                                    if url.strip() and ('http://' in url or 'https://' in url)]
+                        urls.extend(found_urls)
+                    else:
+                        urls.append(element_text.strip())
+        
+        return urls, None
+    except ET.ParseError as e:
+        return None, f"Błąd przy parsowaniu XML: {str(e)}"
 
 def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_node_name, separator=","):
     try:
@@ -1024,23 +1068,21 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
     except Exception as e:
         return None, f"Błąd przy aktualizacji XML: {str(e)}"
 
+@handle_errors
 def extract_image_urls_from_csv(csv_content, column_name, separator=","):
-    try:
-        df = pd.read_csv(io.StringIO(csv_content))
-        if column_name not in df.columns:
-            return None, f"Kolumna '{column_name}' nie istnieje w pliku CSV."
-
-        urls = []
-        for value in df[column_name]:
-            if pd.notna(value):
-                if separator in str(value):
-                    urls.extend([url.strip() for url in str(value).split(separator) if url.strip()])
-                else:
-                    urls.append(str(value).strip())
-
-        return urls, None
-    except Exception as e:
-        return None, f"Błąd przy parsowaniu CSV: {str(e)}"
+    df = pd.read_csv(io.StringIO(csv_content))
+    if column_name not in df.columns:
+        return None, f"Kolumna '{column_name}' nie istnieje w pliku CSV."
+    
+    urls = []
+    for value in df[column_name]:
+        if pd.notna(value):
+            if separator in str(value):
+                urls.extend([url.strip() for url in str(value).split(separator) if url.strip()])
+            else:
+                urls.append(str(value).strip())
+    
+    return urls, None
 
 def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_name, separator=","):
     try:
@@ -1184,6 +1226,37 @@ def save_processing_state(session_id, urls, processed_urls, new_urls_map, file_i
     
     return state_file
 
+def verify_state_consistency(state):
+    """Weryfikuje spójność stanu i zwraca listę problemów"""
+    problems = []
+    
+    required_keys = ["session_id", "timestamp", "file_info", "processing_params", 
+                    "total_urls", "processed_urls", "new_urls_map", "remaining_urls"]
+    
+    # Sprawdź wymagane klucze
+    for key in required_keys:
+        if key not in state:
+            problems.append(f"Brak wymaganego klucza: {key}")
+            
+    # Sprawdź spójność liczby URL-i
+    if "total_urls" in state and "processed_urls" in state and "remaining_urls" in state:
+        total = state["total_urls"]
+        processed = len(state["processed_urls"])
+        remaining = len(state["remaining_urls"])
+        
+        if total != processed + remaining:
+            problems.append(f"Niespójność liczby URL-i: total={total}, processed={processed}, remaining={remaining}")
+            
+    # Sprawdź spójność mapowania URL-i
+    if "new_urls_map" in state and "processed_urls" in state:
+        mapped_urls = set(state["new_urls_map"].keys())
+        processed_urls = set(state["processed_urls"])
+        
+        if mapped_urls != processed_urls:
+            problems.append("Niespójność między przetworzonymi URL-ami a mapowaniem")
+            
+    return problems
+
 def load_processing_state(session_id=None):
     state_dir = os.path.join(os.path.expanduser("~"), ".xml_image_processor")
     if not os.path.exists(state_dir):
@@ -1192,8 +1265,31 @@ def load_processing_state(session_id=None):
     if session_id:
         state_file = os.path.join(state_dir, f"session_{session_id}.json")
         if os.path.exists(state_file):
-            with open(state_file, "r") as f:
-                return json.load(f)
+            try:
+                with open(state_file, "r") as f:
+                    state = json.load(f)
+                    
+                # Sprawdź spójność stanu
+                problems = verify_state_consistency(state)
+                if problems:
+                    st.warning("⚠️ Wykryto problemy ze stanem sesji:")
+                    for problem in problems:
+                        st.warning(f"- {problem}")
+                    
+                    # Spróbuj wczytać kopię zapasową
+                    backup_file = state_file + ".bak"
+                    if os.path.exists(backup_file):
+                        with open(backup_file, "r") as f:
+                            backup_state = json.load(f)
+                        backup_problems = verify_state_consistency(backup_state)
+                        if not backup_problems:
+                            st.info("✅ Wczytano kopię zapasową stanu")
+                            return backup_state
+                            
+                return state
+            except Exception as e:
+                st.error(f"Błąd podczas wczytywania stanu: {str(e)}")
+                return None
         return None
     
     # Znajdź najnowszy plik
@@ -1203,7 +1299,16 @@ def load_processing_state(session_id=None):
     
     state_files.sort(key=lambda x: os.path.getmtime(os.path.join(state_dir, x)), reverse=True)
     with open(os.path.join(state_dir, state_files[0]), "r") as f:
-        return json.load(f)
+        state = json.load(f)
+        
+    # Sprawdź spójność najnowszego stanu
+    problems = verify_state_consistency(state)
+    if problems:
+        st.warning("⚠️ Wykryto problemy z najnowszym stanem:")
+        for problem in problems:
+            st.warning(f"- {problem}")
+    
+    return state
 
 def list_saved_sessions():
     state_dir = os.path.join(os.path.expanduser("~"), ".xml_image_processor")
@@ -1236,6 +1341,10 @@ def resume_processing(state, temp_dir, ftp_settings, max_workers=5):
     file_info = state["file_info"]
     processing_params = state["processing_params"]
     session_id = state["session_id"]
+    
+    # Przywróć parametry przetwarzania do sesji
+    st.session_state.file_info = file_info
+    st.session_state.processing_params = processing_params
     
     if not remaining_urls:
         st.success("Wszystkie URL-e zostały już przetworzone.")
@@ -1289,7 +1398,8 @@ def resume_processing(state, temp_dir, ftp_settings, max_workers=5):
         max_workers=max_workers,
         debug_container=debug_area,
         max_retries=3,
-        progress_callback=update_progress
+        progress_callback=update_progress,
+        session_id=session_id
     )
     
     # Update state with new results
@@ -1460,153 +1570,170 @@ def main():
                 help="Wyższa wartość przyspieszy pobieranie, ale może obciążyć łącze"
             )
 
+        # --- Nowa sekcja: kontenery na status i kolejkę ---
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        queue_info = st.empty()
+        debug_area = st.empty()
+        # ---
+
         if st.session_state.file_info and st.button("Pobierz zdjęcia i prześlij na FTP"):
-            file_type = st.session_state.file_info["type"]
-            file_content = st.session_state.file_info["content"]
-
-            # Walidacja wejść
-            if file_type == "xml" and (not xpath or not xpath.strip() or not new_node_name or not new_node_name.strip()):
-                st.error("Podaj prawidłowy XPath i nazwę nowego węzła!")
-                st.stop()
-            elif file_type == "csv" and (not column_name or not column_name.strip() or not new_column_name or not new_column_name.strip()):
-                st.error("Podaj prawidłową nazwę kolumny i nazwę nowej kolumny!")
-                st.stop()
-
-            # Ekstrakcja URL-i
-            if file_type == "xml" and xpath:
-                urls, error = extract_image_urls_from_xml(file_content, xpath, separator)
-            elif file_type == "csv" and column_name:
-                urls, error = extract_image_urls_from_csv(file_content, column_name, separator)
-            else:
-                urls, error = None, "Nie podano ścieżki XPath lub nazwy kolumny."
-
-            if error:
-                st.error(error)
-            elif not urls:
-                st.warning("Nie znaleziono żadnych URL-i zdjęć.")
-            else:
-                # Usuń duplikaty URL-i przy zachowaniu kolejności
-                urls_unique = []
-                seen = set()
-                for url in urls:
-                    if url not in seen:
-                        urls_unique.append(url)
-                        seen.add(url)
+            try:
+                # Generujemy nowe ID sesji
+                session_id = f"{uuid.uuid4().hex}_{int(time.time())}"
                 
-                urls = urls_unique
-                st.success(f"Znaleziono {len(urls)} unikalnych URL-i zdjęć")
-
-                with st.expander("Podgląd znalezionych URL-i"):
-                    for i, url in enumerate(urls[:5]):
-                        st.write(f"{i+1}. {url}")
-                    if len(urls) > 5:
-                        st.write(f"... oraz {len(urls)-5} więcej.")
-
-                if not st.session_state.ftp_settings["host"] or not st.session_state.ftp_settings["username"]:
-                    st.error("Podaj dane serwera FTP.")
+                # Walidacja wejść
+                file_type = st.session_state.file_info["type"]
+                file_content = st.session_state.file_info["content"]
+                
+                if file_type == "xml" and (not xpath or not xpath.strip() or not new_node_name or not new_node_name.strip()):
+                    st.error("Podaj prawidłowy XPath i nazwę nowego węzła!")
+                    return
+                elif file_type == "csv" and (not column_name or not column_name.strip() or not new_column_name or not new_column_name.strip()):
+                    st.error("Podaj prawidłową nazwę kolumny i nazwę nowej kolumny!")
+                    return
+                    
+                # Ekstrakcja URL-i
+                if file_type == "xml" and xpath:
+                    urls, error = extract_image_urls_from_xml(file_content, xpath, separator)
+                elif file_type == "csv" and column_name:
+                    urls, error = extract_image_urls_from_csv(file_content, column_name, separator)
                 else:
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    debug_area = st.empty()
+                    urls, error = None, "Nie podano ścieżki XPath lub nazwy kolumny."
                     
-                    # Sesja przetwarzania
-                    session_id = f"{uuid.uuid4().hex}_{int(time.time())}"
+                if error:
+                    st.error(error)
+                    return
+                elif not urls:
+                    st.warning("Nie znaleziono żadnych URL-i zdjęć.")
+                    return
+                
+                # Zapisujemy początkowy stan
+                save_processing_state(
+                    session_id,
+                    urls,
+                    [],
+                    {},
+                    st.session_state.file_info,
+                    st.session_state.processing_params
+                )
+                
+                # Rozpocznij przetwarzanie
+                with tempfile.TemporaryDirectory() as tmpdirname:
+                    status_text.text(f"Inicjalizacja przetwarzania {len(urls)} obrazów...")
+                    queue_info.text("")
+                    start_time = time.time()
+                    st.session_state["last_logs"] = []
+                    st.session_state["output_bytes"] = None
+                    st.session_state["output_filetype"] = file_type
+                    st.session_state["output_filename"] = st.session_state.file_info["name"]
+                    st.session_state["output_log"] = None
+                    st.session_state["output_new_urls_map"] = None
+
+                    # ---
+                    def progress_callback(progress, processed, uploaded, total):
+                        percent = int(progress*100)
+                        elapsed = time.time() - start_time
+                        speed = uploaded/elapsed if elapsed > 0 else 0
+                        remaining = (total-processed)/speed if speed > 0 else 0
+                        status_text.text(f"Przetwarzanie... {processed}/{total} ({percent}%) | Przesłano na FTP: {uploaded} | Szybkość: {speed:.1f} obrazów/s | ~{int(remaining/60)}m {int(remaining%60)}s pozostało")
+                        progress_bar.progress(progress)
+                    # ---
+                    def queue_callback(info):
+                        queue_info.text(info)
+                    # ---
+                    # Ulepszona funkcja przetwarzania równoległego
+                    new_urls_map, downloaded_images, failed_urls = process_images_in_parallel(
+                        urls,
+                        tmpdirname,
+                        st.session_state.ftp_settings,
+                        max_workers=max_workers,
+                        debug_container=debug_area,
+                        max_retries=3,
+                        progress_callback=progress_callback,
+                        session_id=session_id
+                    )
+                    # ---
+                    progress_bar.progress(1.0)
+                    status_text.text(f"Zakończono przetwarzanie. Pobrano i przesłano {len(new_urls_map)} z {len(urls)} obrazów.")
                     
-                    with tempfile.TemporaryDirectory() as tmpdirname:
-                        status_text.text(f"Inicjalizacja przetwarzania {len(urls)} obrazów...")
-                        
-                        # Mierzenie czasu wykonania
-                        start_time = time.time()
-                        
-                        # Korzystamy z ulepszonej funkcji przetwarzania równoległego
-                        new_urls_map, downloaded_images, failed_urls = process_images_in_parallel(
-                            urls,
-                            tmpdirname,
-                            st.session_state.ftp_settings,
-                            max_workers=max_workers,
-                            debug_container=debug_area,
-                            max_retries=3,
-                            progress_callback=lambda progress, processed, uploaded, total: status_text.text(
-                                f"Przetwarzanie... {processed}/{total} ({int(progress*100)}%) | "
-                                f"Przesłano na FTP: {uploaded} | "
-                                f"Szybkość: {uploaded/(time.time()-start_time):.1f} obrazów/s | "
-                                f"~{int((total-processed)/(processed/(time.time()-start_time))/60)}m pozostało"
-                            ) if processed > 0 else status_text.text(f"Przetwarzanie... {processed}/{total} (0%)")
-                        )
-                        
-                        # Zakończenie przetwarzania
-                        progress_bar.progress(1.0)
-                        status_text.text(f"Zakończono przetwarzanie. Pobrano i przesłano {len(new_urls_map)} z {len(urls)} obrazów.")
-                        
-                        # Zapisz stan
-                        processed_urls = list(new_urls_map.keys())
-                        remaining_urls = [url for url in urls if url not in processed_urls]
-                        save_processing_state(
-                            session_id, urls, processed_urls, new_urls_map, 
-                            st.session_state.file_info, st.session_state.processing_params
-                        )
-                        
-                        # Raportuj błędy
-                        if failed_urls:
-                            with st.expander(f"Nie udało się przetworzyć {len(failed_urls)} URL-i"):
-                                for fail in failed_urls[:20]:
-                                    st.warning(f"{fail['url']}: {fail['error']}")
-                                if len(failed_urls) > 20:
-                                    st.warning(f"... oraz {len(failed_urls) - 20} więcej.")
-                        
-                        # Aktualizacja pliku
-                        if new_urls_map:
-                            # Wybór odpowiedniej funkcji aktualizacji
-                            if file_type == "xml":
-                                updated_content, error = update_xml_with_new_urls(
-                                    file_content, xpath, new_urls_map, new_node_name, separator
-                                )
-                            else:
-                                updated_content, error = update_csv_with_new_urls(
-                                    file_content, column_name, new_urls_map, new_column_name, separator
-                                )
+                    # Zapisz stan
+                    processed_urls = list(new_urls_map.keys())
+                    remaining_urls = [url for url in urls if url not in processed_urls]
+                    save_processing_state(
+                        session_id, urls, processed_urls, new_urls_map, 
+                        st.session_state.file_info, st.session_state.processing_params
+                    )
+                    
+                    # Raportuj błędy
+                    if failed_urls:
+                        with st.expander(f"Nie udało się przetworzyć {len(failed_urls)} URL-i"):
+                            for fail in failed_urls[:20]:
+                                st.warning(f"{fail['url']}: {fail['error']}")
+                            if len(failed_urls) > 20:
+                                st.warning(f"... oraz {len(failed_urls) - 20} więcej.")
+                    
+                    # Aktualizacja pliku
+                    if new_urls_map:
+                        # Wybór odpowiedniej funkcji aktualizacji
+                        if file_type == "xml":
+                            updated_content, error = update_xml_with_new_urls(
+                                file_content, xpath, new_urls_map, new_node_name, separator
+                            )
+                        else:
+                            updated_content, error = update_csv_with_new_urls(
+                                file_content, column_name, new_urls_map, new_column_name, separator
+                            )
 
-                            if error:
-                                st.error(f"Błąd podczas aktualizacji pliku: {error}")
-                            else:
-                                # Kodowanie wyniku
-                                st.session_state.output_bytes = updated_content.encode(
-                                    st.session_state.file_info["encoding"]
-                                )
-                                st.success("Plik został zaktualizowany o nowe linki FTP.")
-                                
-                                # Google Drive
-                                try:
-                                    success, message = save_to_google_drive(
-                                        st.session_state.output_bytes,
-                                        st.session_state.file_info,
-                                        new_urls_map
-                                    )
-                                    
-                                    if success:
-                                        st.success(f"✅ {message}")
-                                    else:
-                                        st.warning(f"⚠️ {message}")
-                                
-                                except Exception as e:
-                                    st.error(f"Błąd Google Drive: {str(e)}")
-
-                                # Przycisk pobierania
-                                original_name = st.session_state.file_info["name"]
-                                base_name = os.path.splitext(original_name)[0]
-                                st.download_button(
-                                    label="📁 Pobierz zaktualizowany plik",
-                                    data=st.session_state.output_bytes,
-                                    file_name=f"{base_name}_updated.{file_type}",
-                                    mime="text/plain"
+                        if error:
+                            st.error(f"Błąd podczas aktualizacji pliku: {error}")
+                        else:
+                            # Kodowanie wyniku
+                            st.session_state.output_bytes = updated_content.encode(
+                                st.session_state.file_info["encoding"]
+                            )
+                            st.success("Plik został zaktualizowany o nowe linki FTP.")
+                            
+                            # Google Drive
+                            try:
+                                success, message = save_to_google_drive(
+                                    st.session_state.output_bytes,
+                                    st.session_state.file_info,
+                                    new_urls_map
                                 )
                                 
-                                # Jeśli są nieudane URL-e, zaproponuj ponowienie
-                                if failed_urls and len(failed_urls) > 0:
-                                    st.warning(f"Nie udało się przetworzyć {len(failed_urls)} obrazów. Możesz wznowić przetwarzanie z zakładki 'Wznów przetwarzanie'.")
+                                if success:
+                                    st.success(f"✅ {message}")
+                                else:
+                                    st.warning(f"⚠️ {message}")
+                                
+                            except Exception as e:
+                                st.error(f"Błąd Google Drive: {str(e)}")
 
-                        if st.button("Rozpocznij nową operację"):
-                            reset_app_state()
+                            # Przycisk pobierania
+                            original_name = st.session_state.file_info["name"]
+                            base_name = os.path.splitext(original_name)[0]
+                            st.download_button(
+                                label="📁 Pobierz zaktualizowany plik",
+                                data=st.session_state.output_bytes,
+                                file_name=f"{base_name}_updated.{file_type}",
+                                mime="text/plain"
+                            )
+                            
+                            # Jeśli są nieudane URL-e, zaproponuj ponowienie
+                            if failed_urls and len(failed_urls) > 0:
+                                st.warning(f"Nie udało się przetworzyć {len(failed_urls)} obrazów. Możesz wznowić przetwarzanie z zakładki 'Wznów przetwarzanie'.")
+
+                    if st.button("Rozpocznij nową operację"):
+                        reset_app_state()
+
+            except (KeyboardInterrupt, SystemExit, st.runtime.scriptrunner.StopException):
+                st.warning("Przetwarzanie zostało przerwane. Możesz je wznowić później z zakładki 'Wznów przetwarzanie'.")
+                return
+            except Exception as e:
+                st.error(f"Wystąpił błąd: {str(e)}")
+                st.info("Możesz spróbować wznowić przetwarzanie z zakładki 'Wznów przetwarzanie'.")
+                return
 
     with tab2:
         st.subheader("Wznów wcześniej przerwane przetwarzanie")
