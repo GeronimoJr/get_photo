@@ -15,6 +15,9 @@ import shutil
 import uuid
 import codecs
 from bs4 import BeautifulSoup
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+from oauth2client.service_account import ServiceAccountCredentials
 
 def authenticate_user():
     if "authenticated" not in st.session_state:
@@ -442,7 +445,7 @@ def extract_image_urls_from_csv(csv_content, column_name, separator=","):
     except Exception as e:
         return None, f"Błąd podczas parsowania CSV: {str(e)}"
 
-def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_name):
+def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_name, separator=","):
     try:
         if not new_column_name or not new_column_name.strip():
             return None, "Nazwa nowej kolumny nie może być pusta"
@@ -458,18 +461,123 @@ def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_
         for idx, value in enumerate(df[column_name]):
             if pd.notna(value):
                 value_str = str(value).strip()
-                if value_str in new_urls_map:
-                    df.at[idx, new_column_name] = new_urls_map[value_str]
+                
+                # Obsługa wielu URL-i rozdzielonych separatorem
+                if separator in value_str:
+                    urls = [url.strip() for url in value_str.split(separator)]
+                    new_urls = []
+                    
+                    for url in urls:
+                        if url in new_urls_map:
+                            new_urls.append(new_urls_map[url])
+                    
+                    if new_urls:
+                        df.at[idx, new_column_name] = separator.join(new_urls)
                 else:
-                    for key in new_urls_map:
-                        if value_str.replace(" ", "") == key.replace(" ", ""):
-                            df.at[idx, new_column_name] = new_urls_map[key]
-                            break
+                    # Obsługa pojedynczego URL
+                    if value_str in new_urls_map:
+                        df.at[idx, new_column_name] = new_urls_map[value_str]
+                    else:
+                        # Próba dopasowania bez białych znaków
+                        for key in new_urls_map:
+                            if value_str.replace(" ", "") == key.replace(" ", ""):
+                                df.at[idx, new_column_name] = new_urls_map[key]
+                                break
 
         return df.to_csv(index=False), None
 
     except Exception as e:
         return None, f"Błąd podczas aktualizacji CSV: {str(e)}"
+
+def save_to_google_drive(output_bytes, file_info, new_urls_map=None):
+    """Zapisuje wyniki do Google Drive"""
+    try:
+        # Sprawdź, czy mamy wszystkie potrzebne dane konfiguracyjne
+        drive_folder_id = st.secrets.get("GOOGLE_DRIVE_FOLDER_ID")
+        credentials_json = st.secrets.get("GOOGLE_DRIVE_CREDENTIALS_JSON")
+        
+        if not drive_folder_id or not credentials_json:
+            return False, "Brak konfiguracji Google Drive."
+
+        now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_filename = f"image_urls_map_{now}.txt"
+        result_filename = f"processed_{now}.{file_info['type']}"
+        
+        # Utwórz tymczasowy katalog
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            # Zapisz pliki tymczasowo
+            temp_result_path = os.path.join(tmpdirname, f"output.{file_info['type']}")
+            temp_log_path = os.path.join(tmpdirname, "log.txt")
+            
+            with open(temp_result_path, "wb") as f:
+                f.write(output_bytes)
+                
+            # Przygotuj log z mapowaniem URL-i
+            log_content = f"# Raport z przetwarzania obrazów - {now}\n\n"
+            log_content += f"## Informacje o pliku\n"
+            log_content += f"- Nazwa pliku: {file_info['name']}\n"
+            log_content += f"- Typ pliku: {file_info['type'].upper()}\n"
+            log_content += f"- Kodowanie: {file_info['encoding']}\n\n"
+            
+            log_content += f"## Mapowanie URL-i obrazów\n\n"
+            if new_urls_map:
+                for i, (original_url, new_url) in enumerate(new_urls_map.items(), 1):
+                    log_content += f"### Obraz #{i}\n"
+                    log_content += f"- Oryginalny URL: {original_url}\n"
+                    log_content += f"- Nowy URL: {new_url}\n\n"
+            else:
+                log_content += "Brak mapowania URL-i\n"
+                
+            with open(temp_log_path, "w", encoding='utf-8') as f:
+                f.write(log_content)
+            
+            # Uwierzytelnianie Google Drive
+            with st.spinner("Zapisuję na Google Drive..."):
+                # Przygotuj poświadczenia z JSON
+                if isinstance(credentials_json, str):
+                    try:
+                        creds_dict = json.loads(credentials_json)
+                    except json.JSONDecodeError:
+                        return False, "Błąd dekodowania JSON z credentials"
+                else:
+                    creds_dict = credentials_json
+                
+                scope = ["https://www.googleapis.com/auth/drive"]
+                credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+                
+                # Konfiguruj GoogleAuth
+                gauth = GoogleAuth()
+                gauth.credentials = credentials
+                
+                # Utwórz obiekt GoogleDrive
+                drive = GoogleDrive(gauth)
+                
+                try:
+                    # Log operacji
+                    log_file = drive.CreateFile({
+                        "title": log_filename, 
+                        "parents": [{"id": drive_folder_id}],
+                        "mimeType": "text/plain"
+                    })
+                    log_file.SetContentFile(temp_log_path)
+                    log_file.Upload()
+                    
+                    # Plik wynikowy
+                    result_file = drive.CreateFile({
+                        "title": result_filename, 
+                        "parents": [{"id": drive_folder_id}],
+                        "mimeType": f"application/{file_info['type']}"
+                    })
+                    result_file.SetContentFile(temp_result_path)
+                    result_file.Upload()
+                    
+                    return True, "Pliki zostały zapisane na Google Drive."
+                    
+                except Exception as upload_error:
+                    return False, f"Błąd podczas wysyłania plików: {str(upload_error)}"
+            
+    except Exception as e:
+        return False, f"Błąd podczas zapisu na Google Drive: {str(e)}"
 
 def reset_app_state():
     for key in list(st.session_state.keys()):
@@ -663,7 +771,8 @@ def main():
                                     file_content, 
                                     column_name, 
                                     new_urls_map, 
-                                    new_column_name
+                                    new_column_name,
+                                    separator
                                 )
 
                             if error:
@@ -673,6 +782,22 @@ def main():
                                     st.session_state.file_info["encoding"]
                                 )
                                 st.success("Plik został zaktualizowany o nowe linki FTP.")
+                                
+                                # Zapisz na Google Drive
+                                try:
+                                    success, message = save_to_google_drive(
+                                        st.session_state.output_bytes,
+                                        st.session_state.file_info,
+                                        new_urls_map
+                                    )
+                                    
+                                    if success:
+                                        st.success(f"✅ {message}")
+                                    else:
+                                        st.warning(f"⚠️ {message}")
+                                
+                                except Exception as e:
+                                    st.error(f"Błąd podczas zapisywania na Google Drive: {str(e)}")
 
                                 original_name = st.session_state.file_info["name"]
                                 base_name = os.path.splitext(original_name)[0]
