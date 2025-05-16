@@ -312,22 +312,21 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
         if not xml_content or not xml_content.strip():
             return None, "Plik XML jest pusty"
 
+        if not new_node_name or not new_node_name.strip():
+            return None, "Nazwa nowego węzła nie może być pusta"
+
         if xml_content.startswith("\ufeff"):
             xml_content = xml_content[1:]
 
         xml_content = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", xml_content)
 
-        if not new_node_name or new_node_name.strip() == "":
-            return None, "Nazwa nowego węzła nie może być pusta"
-
-        # Sprawdzanie, czy nowa nazwa węzła jest poprawna
-        if not re.match(r'^[a-zA-Z0-9_-]+$', new_node_name):
-            return None, "Nazwa nowego węzła może zawierać tylko litery, cyfry, podkreślenia i myślniki"
-
+        # Sprawdzamy, czy mamy do czynienia z prostym przypadkiem product/image
         if xpath_expression == "//product/image" or xpath_expression == "product/image":
             try:
                 updated_xml = xml_content
-                changes_made = False
+
+                # Debugowanie
+                st.write(f"Aktualizacja XML z {len(new_urls_map)} nowymi URL-ami")
 
                 for original_url, new_url in new_urls_map.items():
                     # Escapujemy URL dla użycia w wyrażeniu regularnym
@@ -340,32 +339,24 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
                     if not re.search(check_pattern, updated_xml):
                         # Dodajemy nowy węzeł po węźle <image>
                         replacement = f"\\1\n<{new_node_name}>{new_url}</{new_node_name}>"
-                        new_xml = re.sub(pattern, replacement, updated_xml)
-                        if new_xml != updated_xml:
-                            updated_xml = new_xml
-                            changes_made = True
-
-                if not changes_made:
-                    # Sprawdź, czy wszystkie URL już mają odpowiednie węzły
-                    for original_url in new_urls_map.keys():
-                        escaped_url = re.escape(original_url)
-                        check_pattern = f"<image>{escaped_url}</image>\\s*<{new_node_name}>"
-                        if re.search(check_pattern, updated_xml):
-                            return updated_xml, None
-                    return None, "Nie znaleziono pasujących węzłów do aktualizacji"
+                        updated_xml = re.sub(pattern, replacement, updated_xml)
+                        # Debugowanie
+                        st.write(f"Dodano nowy węzeł dla {original_url}")
 
                 return updated_xml, None
             except Exception as e:
-                return (
-                    None,
-                    f"Błąd podczas aktualizacji XML z wyrażeniami regularnymi: {str(e)}",
-                )
+                st.error(f"Błąd podczas aktualizacji XML z wyrażeniami regularnymi: {str(e)}")
+                return None, f"Błąd podczas aktualizacji XML z wyrażeniami regularnymi: {str(e)}"
 
         try:
             # Używamy niestandardowego parsera, który zachowuje komentarze
             parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
             root = ET.fromstring(xml_content, parser=parser)
 
+            # Debugowanie
+            st.write(f"Parsowanie XML z XPath: {xpath_expression}")
+
+            # Normalizujemy XPath
             if xpath_expression.startswith("//"):
                 xpath_parts = xpath_expression[2:].split("/")
                 search_path = ".//" + xpath_parts[-1]
@@ -374,11 +365,19 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
             else:
                 search_path = xpath_expression
 
-            changes_made = False
+            # Debugowanie
+            st.write(f"Znormalizowany XPath: {search_path}")
+
+            # Szukamy wszystkich elementów pasujących do XPath
+            found_elements = 0
+            updated_elements = 0
+
             for element in root.findall(search_path):
+                found_elements += 1
                 element_text = element.text.strip() if element.text else ""
 
                 if element_text in new_urls_map:
+                    # Szukamy rodzica elementu
                     parent = None
                     for p in root.iter():
                         if element in list(p):
@@ -389,7 +388,7 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
                         # Sprawdzamy, czy węzeł z nową nazwą już istnieje
                         existing_node = None
                         for sibling in parent:
-                            if sibling.tag == new_node_name:
+                            if sibling.tag == new_node_name and sibling.text == new_urls_map[element_text]:
                                 existing_node = sibling
                                 break
 
@@ -399,35 +398,58 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
                             new_element.text = new_urls_map[element_text]
                             idx = list(parent).index(element)
                             parent.insert(idx + 1, new_element)
-                            changes_made = True
-                        elif existing_node.text != new_urls_map[element_text]:
-                            # Aktualizujemy istniejący węzeł, jeśli URL się zmienił
-                            existing_node.text = new_urls_map[element_text]
-                            changes_made = True
+                            updated_elements += 1
+                            # Debugowanie
+                            st.write(f"Dodano nowy węzeł {new_node_name} dla URL: {element_text}")
 
-            if not changes_made:
-                # Sprawdź, czy wszystkie URL już mają odpowiednie węzły
-                for element in root.findall(search_path):
-                    element_text = element.text.strip() if element.text else ""
-                    if element_text in new_urls_map:
-                        parent = None
-                        for p in root.iter():
-                            if element in list(p):
-                                parent = p
-                                break
+            # Debugowanie
+            st.write(f"Znaleziono {found_elements} elementów, zaktualizowano {updated_elements}")
 
-                        if parent is not None:
-                            for sibling in parent:
-                                if sibling.tag == new_node_name and sibling.text == new_urls_map[element_text]:
-                                    return ET.tostring(root, encoding="unicode", method="xml"), None
+            # Jeśli nic nie zaktualizowano, sprawdź czy XPath jest poprawny
+            if found_elements == 0:
+                st.warning(f"Nie znaleziono żadnych elementów pasujących do XPath: {search_path}")
+                # Próbujemy bardziej ogólnego XPath
+                fallback_xpath = f".//{xpath_expression.split('/')[-1]}"
+                st.write(f"Próba z alternatywnym XPath: {fallback_xpath}")
+                elements = root.findall(fallback_xpath)
+                if elements:
+                    st.write(f"Znaleziono {len(elements)} elementów z alternatywnym XPath")
+                    for element in elements:
+                        st.write(f"Element: {element.tag}, tekst: {element.text if element.text else 'pusty'}")
 
-                return None, "Nie znaleziono pasujących węzłów do aktualizacji"
+            # Konwertujemy z powrotem do stringa
+            updated_xml = ET.tostring(root, encoding="unicode", method="xml")
+            return updated_xml, None
 
-            return ET.tostring(root, encoding="unicode", method="xml"), None
         except ET.ParseError as e:
-            return None, f"Błąd podczas aktualizacji XML z ElementTree: {str(e)}"
+            st.error(f"Błąd podczas parsowania XML: {str(e)}")
+            # Próbujemy alternatywnego podejścia z wyrażeniami regularnymi
+            st.write("Próba alternatywnego podejścia z wyrażeniami regularnymi...")
+
+            try:
+                updated_xml = xml_content
+                pattern_template = r"<{0}>(.*?)</{0}>"
+
+                # Wyciągamy nazwę węzła z XPath
+                node_name = xpath_expression.split("/")[-1]
+                pattern = pattern_template.format(node_name)
+
+                for original_url, new_url in new_urls_map.items():
+                    escaped_url = re.escape(original_url)
+                    node_pattern = f"<{node_name}>{escaped_url}</{node_name}>"
+                    check_pattern = f"<{node_name}>{escaped_url}</{node_name}>\\s*<{new_node_name}>"
+
+                    if not re.search(check_pattern, updated_xml):
+                        replacement = f"<{node_name}>{original_url}</{node_name}>\n<{new_node_name}>{new_url}</{new_node_name}>"
+                        updated_xml = updated_xml.replace(f"<{node_name}>{original_url}</{node_name}>", replacement)
+
+                return updated_xml, None
+
+            except Exception as regex_error:
+                return None, f"Błąd podczas aktualizacji XML: {str(e)}\nBłąd alternatywnej metody: {str(regex_error)}"
 
     except Exception as e:
+        st.error(f"Nieoczekiwany błąd: {str(e)}")
         return None, f"Nieoczekiwany błąd: {str(e)}"
 
 def extract_image_urls_from_csv(csv_content, column_name, separator=","):
@@ -456,9 +478,14 @@ def extract_image_urls_from_csv(csv_content, column_name, separator=","):
 
 def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_name):
     try:
-        if not new_column_name or new_column_name.strip() == "":
+        if not new_column_name or not new_column_name.strip():
             return None, "Nazwa nowej kolumny nie może być pusta"
 
+        # Debugowanie
+        st.write(f"Aktualizacja CSV z {len(new_urls_map)} nowymi URL-ami")
+        st.write(f"Kolumna źródłowa: {column_name}, nowa kolumna: {new_column_name}")
+
+        # Wczytujemy CSV do DataFrame
         df = pd.read_csv(io.StringIO(csv_content))
 
         if column_name not in df.columns:
@@ -467,28 +494,58 @@ def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_
         # Dodajemy nową kolumnę jeśli jeszcze nie istnieje
         if new_column_name not in df.columns:
             df[new_column_name] = ""
+            st.write(f"Utworzono nową kolumnę: {new_column_name}")
 
-        changes_made = False
         # Wypełniamy nową kolumnę wartościami z mapy URL-i
+        updated_rows = 0
         for idx, value in enumerate(df[column_name]):
-            if pd.notna(value) and str(value).strip() in new_urls_map:
-                new_url = new_urls_map[str(value).strip()]
-                if df.at[idx, new_column_name] != new_url:
-                    df.at[idx, new_column_name] = new_url
-                    changes_made = True
+            if pd.notna(value):
+                value_str = str(value).strip()
+                if value_str in new_urls_map:
+                    df.at[idx, new_column_name] = new_urls_map[value_str]
+                    updated_rows += 1
+                    # Debugowanie
+                    if updated_rows <= 5:  # Pokaż tylko pierwsze 5 aktualizacji
+                        st.write(f"Zaktualizowano wiersz {idx+1}: {value_str} -> {new_urls_map[value_str]}")
 
-        if not changes_made:
-            # Sprawdź, czy wszystkie URL już mają odpowiednie wartości w nowej kolumnie
+        st.write(f"Zaktualizowano {updated_rows} wierszy w pliku CSV")
+
+        # Jeśli nie zaktualizowano żadnego wiersza, spróbujmy bardziej szczegółowego debugowania
+        if updated_rows == 0:
+            st.warning("Nie zaktualizowano żadnego wiersza. Sprawdzanie przyczyny...")
+
+            # Sprawdźmy kilka pierwszych wartości w kolumnie źródłowej
+            st.write("Pierwsze 5 wartości w kolumnie źródłowej:")
+            for idx, value in enumerate(df[column_name].head(5)):
+                st.write(f"{idx+1}. '{value}'")
+
+            # Sprawdźmy kilka pierwszych kluczy w mapie URL-i
+            st.write("Pierwsze 5 kluczy w mapie URL-i:")
+            for idx, key in enumerate(list(new_urls_map.keys())[:5]):
+                st.write(f"{idx+1}. '{key}'")
+
+            # Sprawdźmy, czy problem może być z typami danych
+            st.write(f"Typ danych kolumny {column_name}: {df[column_name].dtype}")
+
+            # Spróbujmy alternatywnego podejścia - porównanie bez białych znaków
+            updated_alt = 0
             for idx, value in enumerate(df[column_name]):
-                if pd.notna(value) and str(value).strip() in new_urls_map:
-                    if df.at[idx, new_column_name] == new_urls_map[str(value).strip()]:
-                        return df.to_csv(index=False), None
+                if pd.notna(value):
+                    value_str = str(value).strip()
+                    for key in new_urls_map:
+                        if value_str.replace(" ", "") == key.replace(" ", ""):
+                            df.at[idx, new_column_name] = new_urls_map[key]
+                            updated_alt += 1
+                            break
 
-            return None, "Nie znaleziono pasujących URL do aktualizacji w pliku CSV"
+            if updated_alt > 0:
+                st.success(f"Alternatywne podejście zaktualizowało {updated_alt} wierszy")
 
+        # Konwertujemy z powrotem do stringa
         return df.to_csv(index=False), None
 
     except Exception as e:
+        st.error(f"Błąd podczas aktualizacji CSV: {str(e)}")
         return None, f"Błąd podczas aktualizacji CSV: {str(e)}"
 
 def reset_app_state():
@@ -595,25 +652,20 @@ def main():
             file_type = st.session_state.file_info["type"]
             file_content = st.session_state.file_info["content"]
 
-            # Sprawdzenie poprawności danych wejściowych
-            if file_type == "xml":
-                if not xpath or xpath.strip() == "":
-                    st.error("Podaj poprawną ścieżkę XPath do węzła zawierającego URL-e zdjęć.")
-                    st.stop()
-                if not new_node_name or new_node_name.strip() == "":
-                    st.error("Podaj nazwę nowego węzła dla linków FTP.")
-                    st.stop()
+            # Sprawdzenie, czy wszystkie wymagane pola są wypełnione
+            if file_type == "xml" and (not xpath or not xpath.strip() or not new_node_name or not new_node_name.strip()):
+                st.error("Podaj prawidłowy XPath i nazwę nowego węzła!")
+                st.stop()
+            elif file_type == "csv" and (not column_name or not column_name.strip() or not new_column_name or not new_column_name.strip()):
+                st.error("Podaj prawidłową nazwę kolumny i nazwę nowej kolumny!")
+                st.stop()
+
+            if file_type == "xml" and xpath:
                 urls, error = extract_image_urls_from_xml(file_content, xpath, separator)
-            elif file_type == "csv":
-                if not column_name or column_name.strip() == "":
-                    st.error("Podaj nazwę kolumny zawierającej URL-e zdjęć.")
-                    st.stop()
-                if not new_column_name or new_column_name.strip() == "":
-                    st.error("Podaj nazwę nowej kolumny dla linków FTP.")
-                    st.stop()
+            elif file_type == "csv" and column_name:
                 urls, error = extract_image_urls_from_csv(file_content, column_name, separator)
             else:
-                urls, error = None, "Nieznany typ pliku."
+                urls, error = None, "Nie podano ścieżki XPath lub nazwy kolumny."
 
             if error:
                 st.error(error)
@@ -695,26 +747,20 @@ def main():
                             if error:
                                 st.error(f"Błąd podczas aktualizacji pliku: {error}")
                             else:
-                                # Sprawdź, czy zaktualizowany plik różni się od oryginału
-                                if updated_content is None:
-                                    st.warning("Nie znaleziono żadnych zmian do wprowadzenia w pliku.")
-                                else:
-                                    encoding = st.session_state.file_info.get("encoding", "utf-8")
-                                    if encoding == "auto-detected":
-                                        encoding = "utf-8"
+                                st.session_state.output_bytes = updated_content.encode(
+                                    st.session_state.file_info["encoding"]
+                                )
+                                st.success("Plik został zaktualizowany o nowe linki FTP.")
 
-                                    st.session_state.output_bytes = updated_content.encode(encoding)
-                                    st.success("Plik został zaktualizowany o nowe linki FTP.")
+                                original_name = st.session_state.file_info["name"]
+                                base_name = os.path.splitext(original_name)[0]
 
-                                    original_name = st.session_state.file_info["name"]
-                                    base_name = os.path.splitext(original_name)[0]
-
-                                    st.download_button(
-                                        label=f"📁 Pobierz zaktualizowany plik",
-                                        data=st.session_state.output_bytes,
-                                        file_name=f"{base_name}_updated.{file_type}",
-                                        mime="text/plain"
-                                    )
+                                st.download_button(
+                                    label=f"📁 Pobierz zaktualizowany plik",
+                                    data=st.session_state.output_bytes,
+                                    file_name=f"{base_name}_updated.{file_type}",
+                                    mime="text/plain"
+                                )
 
                         if st.button("Rozpocznij nową operację"):
                             reset_app_state()
