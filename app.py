@@ -231,27 +231,23 @@ class FTPManager:
         self.close()
 
 class FTPConnectionPool:
-    def __init__(self, settings, max_connections=5):
-        # Prepare a pool of independent FTPManager instances for parallel uploads
-        self.managers = [FTPManager(settings) for _ in range(max_connections)]
-        self.connections = list(self.managers)
+    def __init__(self, max_connections=5):
+        self.pool = ThreadPoolExecutor(max_workers=max_connections)
+        self.connections = []
         self.lock = threading.Lock()
     def get_connection(self):
-        # Acquire an available FTPManager
         with self.lock:
-            while not self.connections:
-                time.sleep(0.1)
+            if not self.connections:
+                return FTPManager.get_instance(st.session_state.ftp_settings)
             return self.connections.pop()
     def release_connection(self, connection):
-        # Return FTPManager to the pool
         with self.lock:
             self.connections.append(connection)
     def close_all(self):
-        # Close all FTPManager instances in the pool
         with self.lock:
-            for mgr in self.managers:
+            for conn in self.connections:
                 try:
-                    mgr.close()
+                    conn.close()
                 except:
                     pass
             self.connections.clear()
@@ -268,18 +264,17 @@ class FTPBatchManager:
     aby zmniejszyć obciążenie serwera FTP i uniknąć blokowania połączeń.
     """
     def __init__(self, settings, max_workers):
-        # Allow each FTPManager to use as many simultaneous connections as workers
-        FTP_CONFIG['MAX_CONNECTIONS'] = max_workers
-        # Initialize pool of FTPManager for parallel uploads
-        self.connection_pool = FTPConnectionPool(settings, max_workers)
-        # Use first manager in pool for initial connection verification
-        self.ftp_manager = self.connection_pool.managers[0]
+        self.settings = settings
+        self.max_workers = max_workers
+        self.batch_size = calculate_batch_size(max_workers * 10, max_workers)
+        self.connection_pool = FTPConnectionPool(max_workers)
         self.upload_queue = queue.Queue()
         self.results = {}
         self.running = False
         self.worker_thread = None
         self.lock = threading.Lock()
         self.semaphore = threading.Semaphore(max_workers)
+        self.ftp_manager = FTPManager.get_instance(settings)
         self.stats = {
             'total_uploaded': 0,
             'failed_uploads': 0,
