@@ -786,12 +786,12 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
                             debug_container.info(f"🔄 Ponawiam {result['retry_count']}/{max_retries} dla {url}: {result.get('error')}")
                         time.sleep(random.uniform(0.5, 1.0))
                         retry_queue.put((url, result["retry_count"]))
-                    else: error
+                    else:  # error
                         failed_urls.append({"url": url, "error": result.get("error", "Nieznany błąd")})
                         processed_count += 1
                         if debug_container:
                             debug_container.warning(f"❌ Błąd dla {url}: {result.get('error')}")
-                
+
                     # Aktualizacja postępu
                     if progress_callback and total_urls > 0:
                         remaining = total_urls - next_url_index + retry_queue.qsize() + len(ftp_tasks)
