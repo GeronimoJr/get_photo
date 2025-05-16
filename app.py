@@ -231,23 +231,27 @@ class FTPManager:
         self.close()
 
 class FTPConnectionPool:
-    def __init__(self, max_connections=5):
-        self.pool = ThreadPoolExecutor(max_workers=max_connections)
-        self.connections = []
+    def __init__(self, settings, max_connections=5):
+        # Prepare a pool of independent FTPManager instances for parallel uploads
+        self.managers = [FTPManager(settings) for _ in range(max_connections)]
+        self.connections = list(self.managers)
         self.lock = threading.Lock()
     def get_connection(self):
+        # Acquire an available FTPManager
         with self.lock:
-            if not self.connections:
-                return self._manager
+            while not self.connections:
+                time.sleep(0.1)
             return self.connections.pop()
     def release_connection(self, connection):
+        # Return FTPManager to the pool
         with self.lock:
             self.connections.append(connection)
     def close_all(self):
+        # Close all FTPManager instances in the pool
         with self.lock:
-            for conn in self.connections:
+            for mgr in self.managers:
                 try:
-                    conn.close()
+                    mgr.close()
                 except:
                     pass
             self.connections.clear()
@@ -264,12 +268,12 @@ class FTPBatchManager:
     aby zmniejszyć obciążenie serwera FTP i uniknąć blokowania połączeń.
     """
     def __init__(self, settings, max_workers):
-        self.settings = settings
-        self.max_workers = max_workers
-        self.batch_size = calculate_batch_size(max_workers * 10, max_workers)
-        self.connection_pool = FTPConnectionPool(max_workers)
-        self.ftp_manager = FTPManager.get_instance(settings)
-        self.connection_pool._manager = self.ftp_manager
+        # Allow each FTPManager to use as many simultaneous connections as workers
+        FTP_CONFIG['MAX_CONNECTIONS'] = max_workers
+        # Initialize pool of FTPManager for parallel uploads
+        self.connection_pool = FTPConnectionPool(settings, max_workers)
+        # Use first manager in pool for initial connection verification
+        self.ftp_manager = self.connection_pool.managers[0]
         self.upload_queue = queue.Queue()
         self.results = {}
         self.running = False
