@@ -709,6 +709,42 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
     ftp_tasks = {}
     ftp_results_lock = threading.Lock()
     
+    def check_ftp_tasks():
+        """Sprawdza status zadań FTP i aktualizuje wyniki"""
+        nonlocal processed_count, new_urls_map
+        completed_tasks = []
+        
+        with ftp_results_lock:
+            for url, task_info in ftp_tasks.items():
+                result = ftp_batch_manager.get_result(task_info["task_id"])
+                if result:
+                    if result["status"] == "success":
+                        new_urls_map[url] = result["url"]
+                        downloaded_images.append({
+                            "original_url": url,
+                            "ftp_url": result["url"],
+                            "filename": result["filename"]
+                        })
+                        completed_tasks.append(url)
+                        processed_count += 1
+                        if debug_container:
+                            debug_container.success(f"✅ FTP zakończone: {url}")
+                    elif result["status"] == "error":
+                        if task_info["retry_count"] < max_retries:
+                            retry_queue.put((url, task_info["retry_count"] + 1))
+                            if debug_container:
+                                debug_container.warning(f"🔄 Ponawiam FTP {task_info['retry_count'] + 1}/{max_retries} dla {url}: {result['error']}")
+                        else:
+                            failed_urls.append({"url": url, "error": f"Błąd FTP: {result['error']}"})
+                            completed_tasks.append(url)
+                            processed_count += 1
+                            if debug_container:
+                                debug_container.error(f"❌ FTP nieudane: {url}: {result['error']}")
+            
+            # Usuń zakończone zadania
+            for url in completed_tasks:
+                del ftp_tasks[url]
+    
     # Dodajemy tylko początkowy batch URL-i
     initial_batch_size = min(max_workers * 2, total_urls)
     for url in urls[:initial_batch_size]:
