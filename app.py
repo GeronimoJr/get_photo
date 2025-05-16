@@ -492,12 +492,12 @@ def read_file_content(uploaded_file):
     except Exception as e:
         return None, f"Błąd podczas odczytu pliku: {str(e)}"
 
-def download_image(url, temp_dir, debug_container=None):
+def download_image(url, temp_dir, log_list=None):
     try:
         parsed_url = urlparse(url)
         if not parsed_url.scheme or not parsed_url.netloc:
-            if debug_container:
-                debug_container.error(f"Nieprawidłowy URL: {url}")
+            if log_list is not None:
+                log_list.append(f"ERROR: Nieprawidłowy URL: {url}")
             return None, f"Nieprawidłowy URL: {url}"
 
         headers = {
@@ -512,8 +512,8 @@ def download_image(url, temp_dir, debug_container=None):
             soup = BeautifulSoup(html_resp.text, "html.parser")
             img_tag = soup.find("img")
             if not img_tag or not img_tag.get("src"):
-                if debug_container:
-                    debug_container.warning(f"Brak <img> w HTML dla {url}")
+                if log_list is not None:
+                    log_list.append(f"WARNING: Brak <img> w HTML dla {url}")
                 return None, "Nie znaleziono znacznika <img> w odpowiedzi HTML"
             img_src = img_tag["src"]
             img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}" if not img_src.startswith("http") else img_src
@@ -523,8 +523,8 @@ def download_image(url, temp_dir, debug_container=None):
         for retry in range(3):
             try:
                 response = requests.get(img_url, headers=headers, stream=False, timeout=15, allow_redirects=True)
-                if debug_container:
-                    debug_container.info(f"{img_url} -> HTTP {response.status_code}, Content-Type: {response.headers.get('Content-Type')}")
+                if log_list is not None:
+                    log_list.append(f"INFO: {img_url} -> HTTP {response.status_code}, Content-Type: {response.headers.get('Content-Type')}")
                 response.raise_for_status()
                 extension = {
                     "image/jpeg": ".jpg", "image/png": ".png",
@@ -535,8 +535,8 @@ def download_image(url, temp_dir, debug_container=None):
                 with open(file_path, "wb") as f:
                     f.write(response.content)
                 file_size = os.path.getsize(file_path)
-                if debug_container:
-                    debug_container.info(f"Zapisano {file_path}, rozmiar: {file_size} bajtów")
+                if log_list is not None:
+                    log_list.append(f"INFO: Zapisano {file_path}, rozmiar: {file_size} bajtów")
                 if file_size > 100 and file_size < 20 * 1024 * 1024:
                     return {"path": file_path, "filename": filename, "original_url": url}, None
                 else:
@@ -544,30 +544,30 @@ def download_image(url, temp_dir, debug_container=None):
                     if retry < 2:
                         continue
                     if file_size <= 100:
-                        if debug_container:
-                            debug_container.warning(f"Plik za mały: {file_size} bajtów dla {url}")
+                        if log_list is not None:
+                            log_list.append(f"WARNING: Plik za mały: {file_size} bajtów dla {url}")
                         return None, f"Pobrany plik jest zbyt mały (rozmiar: {file_size})"
                     else:
-                        if debug_container:
-                            debug_container.warning(f"Plik za duży: {file_size} bajtów dla {url}")
+                        if log_list is not None:
+                            log_list.append(f"WARNING: Plik za duży: {file_size} bajtów dla {url}")
                         return None, f"Plik jest zbyt duży (>20MB, rozmiar: {file_size})"
             except Exception as e:
-                if debug_container:
-                    debug_container.error(f"EXCEPTION: {img_url} -> {str(e)}")
+                if log_list is not None:
+                    log_list.append(f"ERROR: {img_url} -> {str(e)}")
                 if retry == 2:
                     return None, f"Błąd przy pobieraniu: {str(e)}"
     except Exception as e:
-        if debug_container:
-            debug_container.error(f"EXCEPTION (outer): {url} -> {str(e)}")
+        if log_list is not None:
+            log_list.append(f"ERROR (outer): {url} -> {str(e)}")
         return None, f"Błąd: {str(e)}"
 
-def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_container=None):
+def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, log_list=None):
     """Pomocnicza funkcja do przetwarzania pojedynczego URL"""
     try:
-        if debug_container:
-            debug_container.info(f"⬇️ Pobieranie: {url}")
+        if log_list is not None:
+            log_list.append(f"⬇️ Pobieranie: {url}")
             
-        image_info, error = download_image(url, temp_dir, debug_container=debug_container)
+        image_info, error = download_image(url, temp_dir, log_list=log_list)
         
         if error:
             # Dodane bardziej szczegółowe komunikaty dla częstych błędów
@@ -583,8 +583,8 @@ def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_c
             if retry_count < max_retries:
                 # Zwiększ czas oczekiwania między kolejnymi próbami
                 wait_time = 1 + retry_count * 2  # 1s, 3s, 5s...
-                if debug_container:
-                    debug_container.info(f"🔄 Ponawiam {retry_count + 1}/{max_retries} dla {url}: {specific_error} (czekam {wait_time}s)")
+                if log_list is not None:
+                    log_list.append(f"🔄 Ponawiam {retry_count + 1}/{max_retries} dla {url}: {specific_error} (czekam {wait_time}s)")
                 time.sleep(wait_time)
                 return {
                     "status": "retry",
@@ -593,8 +593,8 @@ def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_c
                     "error": specific_error
                 }
             else:
-                if debug_container:
-                    debug_container.warning(f"❌ Błąd pobierania dla {url}: {specific_error}")
+                if log_list is not None:
+                    log_list.append(f"❌ Błąd pobierania dla {url}: {specific_error}")
                 return {
                     "status": "error",
                     "url": url,
@@ -608,8 +608,8 @@ def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_c
                 "error": "Brak informacji o pobranym pliku"
             }
             
-        if debug_container:
-            debug_container.success(f"✅ Pobrano: {url}")
+        if log_list is not None:
+            log_list.append(f"✅ Pobrano: {url}")
             
         return {
             "status": "success",
@@ -622,8 +622,8 @@ def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_c
         exception_details = f"{type(e).__name__}: {str(e)}"
         if retry_count < max_retries:
             wait_time = 1 + retry_count * 2
-            if debug_container:
-                debug_container.info(f"🔄 Ponawiam {retry_count + 1}/{max_retries} dla {url}: {exception_details} (czekam {wait_time}s)")
+            if log_list is not None:
+                log_list.append(f"🔄 Ponawiam {retry_count + 1}/{max_retries} dla {url}: {exception_details} (czekam {wait_time}s)")
             time.sleep(wait_time)
             return {
                 "status": "retry",
@@ -632,8 +632,8 @@ def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_c
                 "error": exception_details
             }
         else:
-            if debug_container:
-                debug_container.error(f"⛔ Błąd dla {url}: {exception_details}")
+            if log_list is not None:
+                log_list.append(f"⛔ Błąd dla {url}: {exception_details}")
             return {
                 "status": "error",
                 "url": url,
@@ -801,7 +801,7 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
                     retry_count=retry_count,
                     temp_dir=temp_dir,
                     max_retries=max_retries,
-                    debug_container=debug_container
+                    log_list=log_list
                 ): (url, retry_count) for url, retry_count in batch
             }
             
@@ -860,6 +860,12 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
     # Close all FTP connections
     for instance in FTPManager._instances.values():
         instance.close()
+    
+    # Po zakończeniu batcha wyświetl logi
+    if log_list:
+        with st.expander("Logi debugowania (pobieranie obrazów)"):
+            for log in log_list:
+                st.write(log)
     
     return new_urls_map, downloaded_images, failed_urls
 
