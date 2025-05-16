@@ -58,7 +58,8 @@ def initialize_session_state():
             "port": 21,
             "username": "",
             "password": "",
-            "directory": "/"
+            "directory": "/",
+            "url_path": ""  # Dodane nowe pole dla ścieżki URL
         }
 
 def read_file_content(uploaded_file):
@@ -223,20 +224,29 @@ def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
         with open(file_path, 'rb') as file:
             ftp.storbinary(f'STOR {remote_filename}', file)
 
-        ftp_url = f"ftp://{ftp_settings['host']}"
-        if ftp_settings["directory"] and ftp_settings["directory"] != "/":
-            if not ftp_settings["directory"].startswith("/"):
-                ftp_url += "/"
-            ftp_url += ftp_settings["directory"]
-            if not ftp_url.endswith("/"):
-                ftp_url += "/"
+        # Tworzenie URL do zdjęcia - użyj zdefiniowanej ścieżki URL jeśli istnieje
+        if ftp_settings.get("url_path") and ftp_settings["url_path"].strip():
+            # Upewnij się, że ścieżka kończy się slashem
+            url_path = ftp_settings["url_path"]
+            if not url_path.endswith('/'):
+                url_path += '/'
+            image_url = f"{url_path}{remote_filename}"
         else:
-            ftp_url += "/"
-        ftp_url += remote_filename
+            # Fallback do FTP URL jeśli nie podano ścieżki URL
+            image_url = f"ftp://{ftp_settings['host']}"
+            if ftp_settings["directory"] and ftp_settings["directory"] != "/":
+                if not ftp_settings["directory"].startswith("/"):
+                    image_url += "/"
+                image_url += ftp_settings["directory"]
+                if not image_url.endswith("/"):
+                    image_url += "/"
+            else:
+                image_url += "/"
+            image_url += remote_filename
 
         ftp.quit()
 
-        return {"success": True, "url": ftp_url, "filename": remote_filename}
+        return {"success": True, "url": image_url, "filename": remote_filename}
 
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -392,11 +402,13 @@ def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_
         if column_name not in df.columns:
             return None, f"Kolumna '{column_name}' nie istnieje w pliku CSV."
 
+        # Dodaj nową kolumnę
         df[new_column_name] = ""
 
-        for idx, value in enumerate(df[column_name]):
-            if pd.notna(value) and value in new_urls_map:
-                df.at[idx, new_column_name] = new_urls_map[value]
+        # Dla każdego wiersza sprawdź, czy URL w kolumnie źródłowej ma odpowiednik w mapie nowych URL-i
+        for idx, row in df.iterrows():
+            if pd.notna(row[column_name]) and row[column_name] in new_urls_map:
+                df.at[idx, new_column_name] = new_urls_map[row[column_name]]
 
         return df.to_csv(index=False), None
 
@@ -483,6 +495,11 @@ def main():
                 "Katalog docelowy", 
                 value=st.session_state.ftp_settings["directory"]
             )
+            # Nowe pole dla ścieżki URL
+            st.session_state.ftp_settings["url_path"] = st.text_input(
+                "Ścieżka URL do zdjęć (np. https://geronimo.hosting24.pl/sellstar.pl/getphoto/)", 
+                value=st.session_state.ftp_settings.get("url_path", "")
+            )
 
         with col2:
             st.session_state.ftp_settings["username"] = st.text_input(
@@ -560,18 +577,8 @@ def main():
 
                                 debug_area.success(f"Przesłano na FTP: {upload_result['filename']}")
 
-                                ftp_url = f"ftp://{st.session_state.ftp_settings['host']}"
-                                if st.session_state.ftp_settings["directory"] and st.session_state.ftp_settings["directory"] != "/":
-                                    if not st.session_state.ftp_settings["directory"].startswith("/"):
-                                        ftp_url += "/"
-                                    ftp_url += st.session_state.ftp_settings["directory"]
-                                    if not ftp_url.endswith("/"):
-                                        ftp_url += "/"
-                                else:
-                                    ftp_url += "/"
-                                ftp_url += upload_result["filename"]
-
-                                new_urls_map[url] = ftp_url
+                                # Używamy nowego URL zwróconego przez funkcję upload_to_ftp
+                                new_urls_map[url] = upload_result["url"]
                             else:
                                 debug_area.warning(f"Nie udało się przesłać {image_info['filename']} na FTP: {upload_result['error']}")
 
