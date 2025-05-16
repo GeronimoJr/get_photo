@@ -21,6 +21,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 import concurrent.futures
 import queue
 import threading
+import traceback
 
 # Stałe konfiguracyjne
 FTP_CONFIG = {
@@ -509,6 +510,7 @@ def download_image(url, temp_dir):
             soup = BeautifulSoup(html_resp.text, "html.parser")
             img_tag = soup.find("img")
             if not img_tag or not img_tag.get("src"):
+                print(f"DEBUG: Brak <img> w HTML dla {url}")
                 return None, "Nie znaleziono znacznika <img> w odpowiedzi HTML"
             img_src = img_tag["src"]
             img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}" if not img_src.startswith("http") else img_src
@@ -518,18 +520,18 @@ def download_image(url, temp_dir):
         for retry in range(3):
             try:
                 response = requests.get(img_url, headers=headers, stream=False, timeout=15, allow_redirects=True)
+                print(f"DEBUG: {img_url} -> HTTP {response.status_code}, Content-Type: {response.headers.get('Content-Type')}")
                 response.raise_for_status()
-                content_type = response.headers.get("Content-Type", "")
-                # Ustal rozszerzenie na podstawie Content-Type, ale nie wymagaj image/
                 extension = {
                     "image/jpeg": ".jpg", "image/png": ".png",
                     "image/gif": ".gif", "image/webp": ".webp"
-                }.get(content_type, ".jpg")
+                }.get(response.headers.get("Content-Type", ""), ".jpg")
                 filename = f"image_{uuid.uuid4().hex}{extension}"
                 file_path = os.path.join(temp_dir, filename)
                 with open(file_path, "wb") as f:
                     f.write(response.content)
                 file_size = os.path.getsize(file_path)
+                print(f"DEBUG: Zapisano {file_path}, rozmiar: {file_size} bajtów")
                 if file_size > 100 and file_size < 20 * 1024 * 1024:
                     return {"path": file_path, "filename": filename, "original_url": url}, None
                 else:
@@ -537,13 +539,17 @@ def download_image(url, temp_dir):
                     if retry < 2:
                         continue
                     if file_size <= 100:
-                        return None, "Pobrany plik jest zbyt mały"
+                        print(f"DEBUG: Plik za mały: {file_size} bajtów dla {url}")
+                        return None, f"Pobrany plik jest zbyt mały (rozmiar: {file_size})"
                     else:
-                        return None, "Plik jest zbyt duży (>20MB)"
+                        print(f"DEBUG: Plik za duży: {file_size} bajtów dla {url}")
+                        return None, f"Plik jest zbyt duży (>20MB, rozmiar: {file_size})"
             except Exception as e:
+                print(f"EXCEPTION: {img_url} -> {traceback.format_exc()}")
                 if retry == 2:
                     return None, f"Błąd przy pobieraniu: {str(e)}"
     except Exception as e:
+        print(f"EXCEPTION (outer): {url} -> {traceback.format_exc()}")
         return None, f"Błąd: {str(e)}"
 
 def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_container=None):
