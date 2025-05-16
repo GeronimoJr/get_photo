@@ -166,7 +166,7 @@ def download_image(url, temp_dir):
         retry_count = 0
         
         while retry_count < max_retries:
-            response = requests.get(img_url, headers=headers, stream=True, timeout=15, allow_redirects=True)
+            response = requests.get(img_url, headers=headers, stream=False, timeout=15, allow_redirects=True)
             response.raise_for_status()
             
             if response.url != img_url:
@@ -193,8 +193,7 @@ def download_image(url, temp_dir):
         file_path = os.path.join(temp_dir, filename)
 
         with open(file_path, "wb") as f:
-            for chunk in response.iter_content(8192):
-                f.write(chunk)
+            f.write(response.content)
 
         if os.path.exists(file_path) and os.path.getsize(file_path) > 100:
             return {"path": file_path, "filename": filename, "original_url": url}, None
@@ -332,7 +331,7 @@ def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
     except Exception as e:
         return None, f"Nieoczekiwany błąd: {str(e)}"
 
-def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_node_name):
+def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_node_name, separator=","):
     import xml.etree.ElementTree as ET
 
     try:
@@ -355,51 +354,61 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
             xpath_expression = xpath_expression[2:]
 
         elements = root.findall(f'.//{xpath_expression}')
-
-        parent_map = {c: p for p in root.iter() for c in p}
-        ftp_images_containers = {}
+        
+        parent_map = {}
+        for parent in root.iter():
+            for child in parent:
+                parent_map[child] = parent
+        
+        parent_to_elements = {}
 
         for element in elements:
-            if is_attribute and attribute_name:
-                original_url = element.attrib.get(attribute_name, "").strip()
-                if original_url in new_urls_map:
-                    new_url = new_urls_map[original_url]
-                    element.set(f"ftp_{attribute_name}", new_url)
-            else:
-                original_url = element.text.strip() if element.text else ""
-                if original_url in new_urls_map:
-                    new_url = new_urls_map[original_url]
-
-                    parent = parent_map.get(element)
+            parent = parent_map.get(element)
+            if parent is None:
+                continue
+                
+            if parent not in parent_to_elements:
+                parent_to_elements[parent] = []
+                
+            parent_to_elements[parent].append(element)
+        
+        for parent, elements_list in parent_to_elements.items():
+            ftp_images = None
+            for child in parent:
+                if child.tag == "ftp_images":
+                    ftp_images = child
+                    break
                     
-                    if parent is not None:
-                        already_exists = any(
-                            sibling.tag == new_node_name and sibling.text == new_url
-                            for sibling in parent
-                        )
-                        if not already_exists:
-                            new_elem = ET.Element(new_node_name)
-                            new_elem.text = new_url
-                            parent.append(new_elem)
-                        
-                        if parent not in ftp_images_containers:
-                            container = None
-                            for child in parent:
-                                if child.tag == "ftp_images":
-                                    container = child
-                                    break
-                            
-                            if container is None:
-                                container = ET.Element("ftp_images")
-                                parent.append(container)
-                            
-                            ftp_images_containers[parent] = container
-                        
-                        container = ftp_images_containers[parent]
-                        if not any(child.tag == new_node_name and child.text == new_url for child in container):
-                            img_elem = ET.Element(new_node_name)
-                            img_elem.text = new_url
-                            container.append(img_elem)
+            if ftp_images is None:
+                ftp_images = ET.Element("ftp_images")
+                parent.append(ftp_images)
+                
+            for element in elements_list:
+                if is_attribute and attribute_name:
+                    original_url = element.attrib.get(attribute_name, "").strip()
+                else:
+                    original_url = element.text.strip() if element.text else ""
+                    
+                if not original_url:
+                    continue
+                    
+                if separator in original_url:
+                    urls = [url.strip() for url in original_url.split(separator)]
+                    new_urls = []
+                    
+                    for url in urls:
+                        if url in new_urls_map:
+                            new_urls.append(new_urls_map[url])
+                    
+                    if new_urls:
+                        ftp_node = ET.Element(new_node_name)
+                        ftp_node.text = separator.join(new_urls)
+                        ftp_images.append(ftp_node)
+                else:
+                    if original_url in new_urls_map:
+                        ftp_node = ET.Element(new_node_name)
+                        ftp_node.text = new_urls_map[original_url]
+                        ftp_images.append(ftp_node)
 
         updated_xml = ET.tostring(root, encoding="unicode")
         return updated_xml, None
@@ -505,15 +514,9 @@ def main():
                     "XPath do węzła zawierającego URL-e zdjęć", 
                     placeholder="Np. //product/image lub //image/@url"
                 )
-                
-                st.info("""
-                **Nowość**: Teraz możesz użyć XPath wskazującego na atrybut, np. `//image/@url`.
-                Obsługiwane są również węzły z CDATA i wiele węzłów `<image>` w jednym produkcie.
-                """)
-                
                 new_node_name = st.text_input(
                     "Nazwa nowego węzła dla linków FTP", 
-                    placeholder="Np. ftp_image"
+                    placeholder="Np. ftp"
                 )
             else:
                 column_name = st.text_input(
@@ -551,7 +554,7 @@ def main():
             st.session_state.ftp_settings["http_path"] = st.text_input(
                 "Ścieżka HTTP do zdjęć (np. https://example.com/images/)",
                 value=st.session_state.ftp_settings.get("http_path", ""),
-                placeholder="https://geronimo.hosting24.pl/sellstar.pl/getphoto/"
+                placeholder="https://example.com/images/"
             )
 
         with col2:
@@ -652,7 +655,8 @@ def main():
                                     file_content, 
                                     xpath, 
                                     new_urls_map, 
-                                    new_node_name
+                                    new_node_name,
+                                    separator
                                 )
                             else:
                                 updated_content, error = update_csv_with_new_urls(
@@ -702,14 +706,14 @@ def main():
         #### XML
 
         - XPath: `//product/image`
-        - Nazwa nowego węzła: `ftp_image`
-        - Ścieżka HTTP: `https://geronimo.hosting24.pl/sellstar.pl/getphoto/`
+        - Nazwa nowego węzła: `ftp`
+        - Ścieżka HTTP: `https://example.com/images/`
 
         #### CSV
 
         - Nazwa kolumny: `image_url`
         - Nazwa nowej kolumny: `ftp_image_url`
-        - Ścieżka HTTP: `https://geronimo.hosting24.pl/sellstar.pl/getphoto/`
+        - Ścieżka HTTP: `https://example.com/images/`
 
         ### Obsługiwane formaty
 
