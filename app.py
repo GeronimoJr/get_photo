@@ -398,8 +398,12 @@ class FTPBatchManager:
             try:
                 self.results[task_id] = {"status": "uploading"}
                 upload_result = self.ftp_manager.upload_file(file_path)
-                
                 if upload_result["success"]:
+                    try:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                    except Exception as e:
+                        print(f"Błąd usuwania pliku tymczasowego: {file_path}: {e}")
                     return {
                         "status": "success", 
                         "url": upload_result["url"], 
@@ -407,9 +411,11 @@ class FTPBatchManager:
                     }
                 else:
                     self.stats['retry_count'] += 1
+                    # NIE usuwaj pliku tutaj!
                     return {"status": "error", "error": upload_result["error"]}
             except Exception as e:
                 self.stats['retry_count'] += 1
+                # NIE usuwaj pliku tutaj!
                 return {"status": "error", "error": str(e)}
                 
     def get_result(self, task_id):
@@ -441,7 +447,7 @@ def authenticate_user():
         if st.button("Zaloguj"):
             if user == st.secrets.get("APP_USER") and password == st.secrets.get("APP_PASSWORD"):
                 st.session_state.authenticated = True
-                st.rerun()
+                # st.rerun()  # USUNIĘTE
             else:
                 st.error("Nieprawidłowy login lub hasło")
         st.stop()
@@ -533,12 +539,10 @@ def download_image(url, temp_dir, log_list=None):
             if log_list is not None:
                 log_list.append(f"ERROR: Nieprawidłowy URL: {url}")
             return None, f"Nieprawidłowy URL: {url}"
-
         headers = {
             "User-Agent": "Mozilla/5.0", "Accept": "*/*",
             "Referer": f"{parsed_url.scheme}://{parsed_url.netloc}/"
         }
-
         # Specjalna obsługa dla image_show.php
         if "image_show.php" in url:
             html_resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
@@ -553,38 +557,33 @@ def download_image(url, temp_dir, log_list=None):
             img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}" if not img_src.startswith("http") else img_src
         else:
             img_url = url
-
         for retry in range(3):
             try:
                 response = requests.get(img_url, headers=headers, stream=False, timeout=15, allow_redirects=True)
                 if log_list is not None:
                     log_list.append(f"INFO: {img_url} -> HTTP {response.status_code}, Content-Type: {response.headers.get('Content-Type')}")
                 response.raise_for_status()
-                extension = {
-                    "image/jpeg": ".jpg", "image/png": ".png",
-                    "image/gif": ".gif", "image/webp": ".webp"
-                }.get(response.headers.get("Content-Type", ""), ".jpg")
+                extension = _get_image_extension(response.headers.get("Content-Type", ""))
                 filename = f"image_{uuid.uuid4().hex}{extension}"
                 file_path = os.path.join(temp_dir, filename)
                 with open(file_path, "wb") as f:
                     f.write(response.content)
-                file_size = os.path.getsize(file_path)
                 if log_list is not None:
-                    log_list.append(f"INFO: Zapisano {file_path}, rozmiar: {file_size} bajtów")
-                if file_size > 100 and file_size < 20 * 1024 * 1024:
+                    log_list.append(f"INFO: Zapisano {file_path}, rozmiar: {os.path.getsize(file_path)} bajtów")
+                if _is_valid_file_size(file_path):
                     return {"path": file_path, "filename": filename, "original_url": url}, None
                 else:
                     os.remove(file_path)
                     if retry < 2:
                         continue
-                    if file_size <= 100:
+                    if os.path.getsize(file_path) <= 100:
                         if log_list is not None:
-                            log_list.append(f"WARNING: Plik za mały: {file_size} bajtów dla {url}")
-                        return None, f"Pobrany plik jest zbyt mały (rozmiar: {file_size})"
+                            log_list.append(f"WARNING: Plik za mały: {os.path.getsize(file_path)} bajtów dla {url}")
+                        return None, f"Pobrany plik jest zbyt mały (rozmiar: {os.path.getsize(file_path)})"
                     else:
                         if log_list is not None:
-                            log_list.append(f"WARNING: Plik za duży: {file_size} bajtów dla {url}")
-                        return None, f"Plik jest zbyt duży (>20MB, rozmiar: {file_size})"
+                            log_list.append(f"WARNING: Plik za duży: {os.path.getsize(file_path)} bajtów dla {url}")
+                        return None, f"Plik jest zbyt duży (>20MB, rozmiar: {os.path.getsize(file_path)})"
             except Exception as e:
                 if log_list is not None:
                     log_list.append(f"ERROR: {img_url} -> {str(e)}")
@@ -728,14 +727,13 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
         """Sprawdza status zadań FTP i aktualizuje wyniki"""
         nonlocal processed_count, new_urls_map
         completed_tasks = []
-        
+        updated = False  # Dodane: flaga czy coś się zmieniło
         with ftp_results_lock:
             for url, task_info in ftp_tasks.items():
                 result = ftp_batch_manager.get_result(task_info["task_id"])
                 if not result:
                     # Zadanie jeszcze nie zakończone
                     continue
-                    
                 if result["status"] == "success":
                     new_urls_map[url] = result["url"]
                     downloaded_images.append({
@@ -745,8 +743,18 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
                     })
                     completed_tasks.append(url)
                     processed_count += 1
+                    updated = True  # Dodane
                     if debug_container:
                         debug_container.success(f"✅ FTP zakończone: {url}")
+                    # --- ZAPISZ STAN PO KAŻDYM SUKCESIE UPLOADU ---
+                    save_processing_state(
+                        session_id,
+                        urls,
+                        list(new_urls_map.keys()),
+                        new_urls_map,
+                        st.session_state.file_info,
+                        st.session_state.processing_params
+                    )
                 elif result["status"] == "error":
                     # Bardziej szczegółowa diagnostyka błędów FTP
                     error_details = result.get("error", "Nieznany błąd FTP")
@@ -758,29 +766,32 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
                         error_category = "Błąd przestrzeni dyskowej"
                     else:
                         error_category = "Błąd FTP"
-                        
                     if task_info["retry_count"] < max_retries:
                         new_retry_count = task_info["retry_count"] + 1
                         # Zwiększ czas oczekiwania między próbami
                         wait_time = min(5, 1 * (new_retry_count))
                         time.sleep(wait_time)
-                        
                         retry_queue.put((url, new_retry_count))
                         completed_tasks.append(url)
-                        
+                        updated = True  # Dodane
                         if debug_container:
                             debug_container.warning(f"🔄 Ponawiam FTP {new_retry_count}/{max_retries} dla {url}: {error_details}")
                     else:
                         failed_urls.append({"url": url, "error": f"{error_category}: {error_details}"})
                         completed_tasks.append(url)
                         processed_count += 1
+                        updated = True  # Dodane
                         if debug_container:
                             debug_container.error(f"❌ FTP nieudane: {url}: {error_details}")
-            
             # Usuń zakończone zadania
             for url in completed_tasks:
                 if url in ftp_tasks:
                     del ftp_tasks[url]
+        # Dodane: aktualizacja postępu jeśli coś się zmieniło
+        if progress_callback and total_urls > 0 and updated:
+            stats = ftp_batch_manager.get_stats()
+            progress = min(0.99, max(0.01, (processed_count) / total_urls))
+            progress_callback(progress, processed_count, stats['total_uploaded'], total_urls)
     
     # Dodajemy tylko początkowy batch URL-i
     initial_batch_size = min(max_workers * 2, total_urls)
@@ -1728,11 +1739,29 @@ def main():
                         reset_app_state()
 
             except (KeyboardInterrupt, SystemExit, st.runtime.scriptrunner.StopException):
-                st.warning("Przetwarzanie zostało przerwane. Możesz je wznowić później z zakładki 'Wznów przetwarzanie'.")
+                # --- ZAPISZ STAN PO PRZERWANIU ---
+                save_processing_state(
+                    session_id,
+                    urls,
+                    list(new_urls_map.keys()) if 'new_urls_map' in locals() else [],
+                    new_urls_map if 'new_urls_map' in locals() else {},
+                    st.session_state.file_info,
+                    st.session_state.processing_params
+                )
+                st.warning("Przetwarzanie zostało przerwane. Postęp został zapisany. Możesz je wznowić później z zakładki 'Wznów przetwarzanie'.")
                 return
             except Exception as e:
+                # --- ZAPISZ STAN PO BŁĘDZIE ---
+                save_processing_state(
+                    session_id,
+                    urls,
+                    list(new_urls_map.keys()) if 'new_urls_map' in locals() else [],
+                    new_urls_map if 'new_urls_map' in locals() else {},
+                    st.session_state.file_info,
+                    st.session_state.processing_params
+                )
                 st.error(f"Wystąpił błąd: {str(e)}")
-                st.info("Możesz spróbować wznowić przetwarzanie z zakładki 'Wznów przetwarzanie'.")
+                st.info("Postęp został zapisany. Możesz spróbować wznowić przetwarzanie z zakładki 'Wznów przetwarzanie'.")
                 return
 
     with tab2:
