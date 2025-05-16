@@ -317,9 +317,17 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
 
         xml_content = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", xml_content)
 
+        if not new_node_name or new_node_name.strip() == "":
+            return None, "Nazwa nowego węzła nie może być pusta"
+
+        # Sprawdzanie, czy nowa nazwa węzła jest poprawna
+        if not re.match(r'^[a-zA-Z0-9_-]+$', new_node_name):
+            return None, "Nazwa nowego węzła może zawierać tylko litery, cyfry, podkreślenia i myślniki"
+
         if xpath_expression == "//product/image" or xpath_expression == "product/image":
             try:
                 updated_xml = xml_content
+                changes_made = False
 
                 for original_url, new_url in new_urls_map.items():
                     # Escapujemy URL dla użycia w wyrażeniu regularnym
@@ -332,7 +340,19 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
                     if not re.search(check_pattern, updated_xml):
                         # Dodajemy nowy węzeł po węźle <image>
                         replacement = f"\\1\n<{new_node_name}>{new_url}</{new_node_name}>"
-                        updated_xml = re.sub(pattern, replacement, updated_xml)
+                        new_xml = re.sub(pattern, replacement, updated_xml)
+                        if new_xml != updated_xml:
+                            updated_xml = new_xml
+                            changes_made = True
+
+                if not changes_made:
+                    # Sprawdź, czy wszystkie URL już mają odpowiednie węzły
+                    for original_url in new_urls_map.keys():
+                        escaped_url = re.escape(original_url)
+                        check_pattern = f"<image>{escaped_url}</image>\\s*<{new_node_name}>"
+                        if re.search(check_pattern, updated_xml):
+                            return updated_xml, None
+                    return None, "Nie znaleziono pasujących węzłów do aktualizacji"
 
                 return updated_xml, None
             except Exception as e:
@@ -342,6 +362,7 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
                 )
 
         try:
+            # Używamy niestandardowego parsera, który zachowuje komentarze
             parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
             root = ET.fromstring(xml_content, parser=parser)
 
@@ -353,6 +374,7 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
             else:
                 search_path = xpath_expression
 
+            changes_made = False
             for element in root.findall(search_path):
                 element_text = element.text.strip() if element.text else ""
 
@@ -367,7 +389,7 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
                         # Sprawdzamy, czy węzeł z nową nazwą już istnieje
                         existing_node = None
                         for sibling in parent:
-                            if sibling.tag == new_node_name and sibling.text == new_urls_map[element_text]:
+                            if sibling.tag == new_node_name:
                                 existing_node = sibling
                                 break
 
@@ -377,6 +399,29 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
                             new_element.text = new_urls_map[element_text]
                             idx = list(parent).index(element)
                             parent.insert(idx + 1, new_element)
+                            changes_made = True
+                        elif existing_node.text != new_urls_map[element_text]:
+                            # Aktualizujemy istniejący węzeł, jeśli URL się zmienił
+                            existing_node.text = new_urls_map[element_text]
+                            changes_made = True
+
+            if not changes_made:
+                # Sprawdź, czy wszystkie URL już mają odpowiednie węzły
+                for element in root.findall(search_path):
+                    element_text = element.text.strip() if element.text else ""
+                    if element_text in new_urls_map:
+                        parent = None
+                        for p in root.iter():
+                            if element in list(p):
+                                parent = p
+                                break
+
+                        if parent is not None:
+                            for sibling in parent:
+                                if sibling.tag == new_node_name and sibling.text == new_urls_map[element_text]:
+                                    return ET.tostring(root, encoding="unicode", method="xml"), None
+
+                return None, "Nie znaleziono pasujących węzłów do aktualizacji"
 
             return ET.tostring(root, encoding="unicode", method="xml"), None
         except ET.ParseError as e:
@@ -411,6 +456,9 @@ def extract_image_urls_from_csv(csv_content, column_name, separator=","):
 
 def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_name):
     try:
+        if not new_column_name or new_column_name.strip() == "":
+            return None, "Nazwa nowej kolumny nie może być pusta"
+
         df = pd.read_csv(io.StringIO(csv_content))
 
         if column_name not in df.columns:
@@ -420,10 +468,23 @@ def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_
         if new_column_name not in df.columns:
             df[new_column_name] = ""
 
+        changes_made = False
         # Wypełniamy nową kolumnę wartościami z mapy URL-i
         for idx, value in enumerate(df[column_name]):
             if pd.notna(value) and str(value).strip() in new_urls_map:
-                df.at[idx, new_column_name] = new_urls_map[str(value).strip()]
+                new_url = new_urls_map[str(value).strip()]
+                if df.at[idx, new_column_name] != new_url:
+                    df.at[idx, new_column_name] = new_url
+                    changes_made = True
+
+        if not changes_made:
+            # Sprawdź, czy wszystkie URL już mają odpowiednie wartości w nowej kolumnie
+            for idx, value in enumerate(df[column_name]):
+                if pd.notna(value) and str(value).strip() in new_urls_map:
+                    if df.at[idx, new_column_name] == new_urls_map[str(value).strip()]:
+                        return df.to_csv(index=False), None
+
+            return None, "Nie znaleziono pasujących URL do aktualizacji w pliku CSV"
 
         return df.to_csv(index=False), None
 
@@ -534,12 +595,25 @@ def main():
             file_type = st.session_state.file_info["type"]
             file_content = st.session_state.file_info["content"]
 
-            if file_type == "xml" and xpath:
+            # Sprawdzenie poprawności danych wejściowych
+            if file_type == "xml":
+                if not xpath or xpath.strip() == "":
+                    st.error("Podaj poprawną ścieżkę XPath do węzła zawierającego URL-e zdjęć.")
+                    st.stop()
+                if not new_node_name or new_node_name.strip() == "":
+                    st.error("Podaj nazwę nowego węzła dla linków FTP.")
+                    st.stop()
                 urls, error = extract_image_urls_from_xml(file_content, xpath, separator)
-            elif file_type == "csv" and column_name:
+            elif file_type == "csv":
+                if not column_name or column_name.strip() == "":
+                    st.error("Podaj nazwę kolumny zawierającej URL-e zdjęć.")
+                    st.stop()
+                if not new_column_name or new_column_name.strip() == "":
+                    st.error("Podaj nazwę nowej kolumny dla linków FTP.")
+                    st.stop()
                 urls, error = extract_image_urls_from_csv(file_content, column_name, separator)
             else:
-                urls, error = None, "Nie podano ścieżki XPath lub nazwy kolumny."
+                urls, error = None, "Nieznany typ pliku."
 
             if error:
                 st.error(error)
@@ -621,20 +695,26 @@ def main():
                             if error:
                                 st.error(f"Błąd podczas aktualizacji pliku: {error}")
                             else:
-                                st.session_state.output_bytes = updated_content.encode(
-                                    st.session_state.file_info["encoding"]
-                                )
-                                st.success("Plik został zaktualizowany o nowe linki FTP.")
+                                # Sprawdź, czy zaktualizowany plik różni się od oryginału
+                                if updated_content is None:
+                                    st.warning("Nie znaleziono żadnych zmian do wprowadzenia w pliku.")
+                                else:
+                                    encoding = st.session_state.file_info.get("encoding", "utf-8")
+                                    if encoding == "auto-detected":
+                                        encoding = "utf-8"
 
-                                original_name = st.session_state.file_info["name"]
-                                base_name = os.path.splitext(original_name)[0]
+                                    st.session_state.output_bytes = updated_content.encode(encoding)
+                                    st.success("Plik został zaktualizowany o nowe linki FTP.")
 
-                                st.download_button(
-                                    label=f"📁 Pobierz zaktualizowany plik",
-                                    data=st.session_state.output_bytes,
-                                    file_name=f"{base_name}_updated.{file_type}",
-                                    mime="text/plain"
-                                )
+                                    original_name = st.session_state.file_info["name"]
+                                    base_name = os.path.splitext(original_name)[0]
+
+                                    st.download_button(
+                                        label=f"📁 Pobierz zaktualizowany plik",
+                                        data=st.session_state.output_bytes,
+                                        file_name=f"{base_name}_updated.{file_type}",
+                                        mime="text/plain"
+                                    )
 
                         if st.button("Rozpocznij nową operację"):
                             reset_app_state()
