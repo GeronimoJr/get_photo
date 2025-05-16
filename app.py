@@ -59,7 +59,7 @@ def initialize_session_state():
             "username": "",
             "password": "",
             "directory": "/",
-            "url_path": ""  # Dodane nowe pole dla ścieżki URL
+            "http_path": ""  # Dodane pole na ścieżkę HTTP
         }
 
 def read_file_content(uploaded_file):
@@ -224,15 +224,14 @@ def upload_to_ftp(file_path, ftp_settings, remote_filename=None):
         with open(file_path, 'rb') as file:
             ftp.storbinary(f'STOR {remote_filename}', file)
 
-        # Tworzenie URL do zdjęcia - użyj zdefiniowanej ścieżki URL jeśli istnieje
-        if ftp_settings.get("url_path") and ftp_settings["url_path"].strip():
-            # Upewnij się, że ścieżka kończy się slashem
-            url_path = ftp_settings["url_path"]
-            if not url_path.endswith('/'):
-                url_path += '/'
-            image_url = f"{url_path}{remote_filename}"
+        # Tworzenie URL do zdjęcia - używamy ścieżki HTTP jeśli jest dostępna
+        if ftp_settings.get("http_path") and ftp_settings["http_path"].strip():
+            http_path = ftp_settings["http_path"].strip()
+            if not http_path.endswith('/'):
+                http_path += '/'
+            image_url = f"{http_path}{remote_filename}"
         else:
-            # Fallback do FTP URL jeśli nie podano ścieżki URL
+            # Fallback do FTP URL jeśli ścieżka HTTP nie jest dostępna
             image_url = f"ftp://{ftp_settings['host']}"
             if ftp_settings["directory"] and ftp_settings["directory"] != "/":
                 if not ftp_settings["directory"].startswith("/"):
@@ -323,10 +322,17 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
                 updated_xml = xml_content
 
                 for original_url, new_url in new_urls_map.items():
+                    # Escapujemy URL dla użycia w wyrażeniu regularnym
                     escaped_url = re.escape(original_url)
+                    # Szukamy węzła <image> zawierającego oryginalny URL
                     pattern = f"(<image>{escaped_url}</image>)"
-                    replacement = f"\\1\n<{new_node_name}>{new_url}</{new_node_name}>"
-                    updated_xml = re.sub(pattern, replacement, updated_xml)
+
+                    # Sprawdzamy, czy już istnieje węzeł z nową nazwą po węźle <image>
+                    check_pattern = f"<image>{escaped_url}</image>\\s*<{new_node_name}>"
+                    if not re.search(check_pattern, updated_xml):
+                        # Dodajemy nowy węzeł po węźle <image>
+                        replacement = f"\\1\n<{new_node_name}>{new_url}</{new_node_name}>"
+                        updated_xml = re.sub(pattern, replacement, updated_xml)
 
                 return updated_xml, None
             except Exception as e:
@@ -358,11 +364,19 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
                             break
 
                     if parent is not None:
-                        new_element = ET.Element(new_node_name)
-                        new_element.text = new_urls_map[element_text]
+                        # Sprawdzamy, czy węzeł z nową nazwą już istnieje
+                        existing_node = None
+                        for sibling in parent:
+                            if sibling.tag == new_node_name and sibling.text == new_urls_map[element_text]:
+                                existing_node = sibling
+                                break
 
-                        idx = list(parent).index(element)
-                        parent.insert(idx + 1, new_element)
+                        # Dodajemy nowy węzeł tylko jeśli jeszcze nie istnieje
+                        if existing_node is None:
+                            new_element = ET.Element(new_node_name)
+                            new_element.text = new_urls_map[element_text]
+                            idx = list(parent).index(element)
+                            parent.insert(idx + 1, new_element)
 
             return ET.tostring(root, encoding="unicode", method="xml"), None
         except ET.ParseError as e:
@@ -402,13 +416,14 @@ def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_
         if column_name not in df.columns:
             return None, f"Kolumna '{column_name}' nie istnieje w pliku CSV."
 
-        # Dodaj nową kolumnę
-        df[new_column_name] = ""
+        # Dodajemy nową kolumnę jeśli jeszcze nie istnieje
+        if new_column_name not in df.columns:
+            df[new_column_name] = ""
 
-        # Dla każdego wiersza sprawdź, czy URL w kolumnie źródłowej ma odpowiednik w mapie nowych URL-i
-        for idx, row in df.iterrows():
-            if pd.notna(row[column_name]) and row[column_name] in new_urls_map:
-                df.at[idx, new_column_name] = new_urls_map[row[column_name]]
+        # Wypełniamy nową kolumnę wartościami z mapy URL-i
+        for idx, value in enumerate(df[column_name]):
+            if pd.notna(value) and str(value).strip() in new_urls_map:
+                df.at[idx, new_column_name] = new_urls_map[str(value).strip()]
 
         return df.to_csv(index=False), None
 
@@ -495,10 +510,11 @@ def main():
                 "Katalog docelowy", 
                 value=st.session_state.ftp_settings["directory"]
             )
-            # Nowe pole dla ścieżki URL
-            st.session_state.ftp_settings["url_path"] = st.text_input(
-                "Ścieżka URL do zdjęć (np. https://geronimo.hosting24.pl/sellstar.pl/getphoto/)", 
-                value=st.session_state.ftp_settings.get("url_path", "")
+            # Nowe pole dla ścieżki HTTP
+            st.session_state.ftp_settings["http_path"] = st.text_input(
+                "Ścieżka HTTP do zdjęć (np. https://example.com/images/)",
+                value=st.session_state.ftp_settings.get("http_path", ""),
+                placeholder="https://geronimo.hosting24.pl/sellstar.pl/getphoto/"
             )
 
         with col2:
@@ -576,8 +592,6 @@ def main():
                                 })
 
                                 debug_area.success(f"Przesłano na FTP: {upload_result['filename']}")
-
-                                # Używamy nowego URL zwróconego przez funkcję upload_to_ftp
                                 new_urls_map[url] = upload_result["url"]
                             else:
                                 debug_area.warning(f"Nie udało się przesłać {image_info['filename']} na FTP: {upload_result['error']}")
@@ -635,8 +649,9 @@ def main():
            - Dla CSV: Podaj nazwę kolumny zawierającej URL-e zdjęć
            - Określ separator, jeśli w jednej komórce/węźle znajduje się wiele URL-i
         3. **Skonfiguruj serwer FTP** - podaj dane dostępowe do serwera FTP
+           - Podaj ścieżkę HTTP, pod którą będą dostępne zdjęcia (np. https://example.com/images/)
         4. **Pobierz zdjęcia i prześlij na FTP** - aplikacja pobierze zdjęcia i prześle je na serwer FTP
-        5. **Pobierz zaktualizowany plik** - plik źródłowy zostanie zaktualizowany o nowe linki FTP
+        5. **Pobierz zaktualizowany plik** - plik źródłowy zostanie zaktualizowany o nowe linki HTTP/FTP
 
         ### Przykłady konfiguracji
 
@@ -644,11 +659,13 @@ def main():
 
         - XPath: `//product/image`
         - Nazwa nowego węzła: `ftp_image`
+        - Ścieżka HTTP: `https://geronimo.hosting24.pl/sellstar.pl/getphoto/`
 
         #### CSV
 
         - Nazwa kolumny: `image_url`
         - Nazwa nowej kolumny: `ftp_image_url`
+        - Ścieżka HTTP: `https://geronimo.hosting24.pl/sellstar.pl/getphoto/`
 
         ### Obsługiwane formaty
 
