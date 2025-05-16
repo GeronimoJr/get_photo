@@ -270,6 +270,11 @@ class FTPBatchManager:
     def __init__(self, settings, max_workers):
         # Allow each FTPManager to use as many simultaneous connections as workers
         FTP_CONFIG['MAX_CONNECTIONS'] = max_workers
+        # Store settings and worker configuration
+        self.settings = settings
+        self.max_workers = max_workers
+        # Calculate batch size based on total URLs approximation
+        self.batch_size = calculate_batch_size(max_workers * 10, max_workers)
         # Initialize pool of FTPManager for parallel uploads
         self.connection_pool = FTPConnectionPool(settings, max_workers)
         # Use first manager in pool for initial connection verification
