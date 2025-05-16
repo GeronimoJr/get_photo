@@ -142,8 +142,11 @@ def download_image(url, temp_dir):
         }
 
         if "image_show.php" in url:
-            html_resp = requests.get(url, headers=headers, timeout=10)
+            html_resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
             html_resp.raise_for_status()
+            
+            if html_resp.url != url:
+                print(f"Przekierowano: {url} -> {html_resp.url}")
 
             soup = BeautifulSoup(html_resp.text, "html.parser")
             img_tag = soup.find("img")
@@ -159,12 +162,25 @@ def download_image(url, temp_dir):
         else:
             img_url = url
 
-        response = requests.get(img_url, headers=headers, stream=True, timeout=15)
-        response.raise_for_status()
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            response = requests.get(img_url, headers=headers, stream=True, timeout=15, allow_redirects=True)
+            response.raise_for_status()
+            
+            if response.url != img_url:
+                print(f"Przekierowano: {img_url} -> {response.url}")
+                img_url = response.url
 
-        content_type = response.headers.get("Content-Type", "")
-        if not content_type.startswith("image/"):
-            return None, f"Nieprawidłowy Content-Type: {content_type}"
+            content_type = response.headers.get("Content-Type", "")
+            if not content_type.startswith("image/"):
+                retry_count += 1
+                if retry_count >= max_retries:
+                    return None, f"Nieprawidłowy Content-Type: {content_type} po {max_retries} próbach"
+                continue
+            else:
+                break
 
         extension = {
             "image/jpeg": ".jpg",
@@ -253,10 +269,22 @@ def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
 
         xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
 
+        is_attribute = xpath_expression.endswith('/@url') or '/@' in xpath_expression
+        attribute_name = None
+        if is_attribute:
+            parts = xpath_expression.split('/@')
+            attribute_name = parts[-1]
+            xpath_expression = parts[0]
+
         if xpath_expression == "//product/image" or xpath_expression == "product/image":
             try:
-                pattern = re.compile(r'<image>(.*?)</image>', re.DOTALL)
-                matches = pattern.findall(xml_content)
+                pattern_simple = re.compile(r'<image>(.*?)</image>', re.DOTALL)
+                pattern_cdata = re.compile(r'<image><!\[CDATA\[(.*?)\]\]></image>', re.DOTALL)
+                
+                matches_simple = pattern_simple.findall(xml_content)
+                matches_cdata = pattern_cdata.findall(xml_content)
+                
+                matches = matches_simple + matches_cdata
 
                 urls = []
                 for match in matches:
@@ -281,7 +309,11 @@ def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
 
             urls = []
             for element in elements:
-                element_text = element.text
+                if is_attribute and attribute_name:
+                    element_text = element.attrib.get(attribute_name)
+                else:
+                    element_text = element.text
+                
                 if element_text:
                     element_text = element_text.replace('&amp;', '&')
                     if 'http://' in element_text or 'https://' in element_text:
@@ -310,39 +342,64 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
         if not new_node_name or not new_node_name.strip():
             return None, "Nazwa nowego węzła nie może być pusta"
 
-        # Parse XML
+        is_attribute = xpath_expression.endswith('/@url') or '/@' in xpath_expression
+        attribute_name = None
+        if is_attribute:
+            parts = xpath_expression.split('/@')
+            attribute_name = parts[-1]
+            xpath_expression = parts[0]
+
         root = ET.fromstring(xml_content)
 
-        # Normalize xpath expression
         if xpath_expression.startswith('//'):
-            xpath_expression = xpath_expression[2:]  # e.g., 'product/image'
+            xpath_expression = xpath_expression[2:]
 
         elements = root.findall(f'.//{xpath_expression}')
 
+        parent_map = {c: p for p in root.iter() for c in p}
+        ftp_images_containers = {}
+
         for element in elements:
-            original_url = element.text.strip() if element.text else ""
-            if original_url in new_urls_map:
-                new_url = new_urls_map[original_url]
+            if is_attribute and attribute_name:
+                original_url = element.attrib.get(attribute_name, "").strip()
+                if original_url in new_urls_map:
+                    new_url = new_urls_map[original_url]
+                    element.set(f"ftp_{attribute_name}", new_url)
+            else:
+                original_url = element.text.strip() if element.text else ""
+                if original_url in new_urls_map:
+                    new_url = new_urls_map[original_url]
 
-                # Get parent node to insert new child
-                parent = element.getparent() if hasattr(element, "getparent") else None
-                if parent is None:
-                    # Attempt to find parent manually
-                    for potential_parent in root.iter():
-                        if element in list(potential_parent):
-                            parent = potential_parent
-                            break
-
-                # Check if the new node already exists
-                if parent is not None:
-                    already_exists = any(
-                        sibling.tag == new_node_name and sibling.text == new_url
-                        for sibling in parent
-                    )
-                    if not already_exists:
-                        new_elem = ET.Element(new_node_name)
-                        new_elem.text = new_url
-                        parent.append(new_elem)
+                    parent = parent_map.get(element)
+                    
+                    if parent is not None:
+                        already_exists = any(
+                            sibling.tag == new_node_name and sibling.text == new_url
+                            for sibling in parent
+                        )
+                        if not already_exists:
+                            new_elem = ET.Element(new_node_name)
+                            new_elem.text = new_url
+                            parent.append(new_elem)
+                        
+                        if parent not in ftp_images_containers:
+                            container = None
+                            for child in parent:
+                                if child.tag == "ftp_images":
+                                    container = child
+                                    break
+                            
+                            if container is None:
+                                container = ET.Element("ftp_images")
+                                parent.append(container)
+                            
+                            ftp_images_containers[parent] = container
+                        
+                        container = ftp_images_containers[parent]
+                        if not any(child.tag == new_node_name and child.text == new_url for child in container):
+                            img_elem = ET.Element(new_node_name)
+                            img_elem.text = new_url
+                            container.append(img_elem)
 
         updated_xml = ET.tostring(root, encoding="unicode")
         return updated_xml, None
@@ -395,7 +452,6 @@ def update_csv_with_new_urls(csv_content, column_name, new_urls_map, new_column_
                 if value_str in new_urls_map:
                     df.at[idx, new_column_name] = new_urls_map[value_str]
                 else:
-                    # Sprawdzamy alternatywne dopasowanie bez białych znaków
                     for key in new_urls_map:
                         if value_str.replace(" ", "") == key.replace(" ", ""):
                             df.at[idx, new_column_name] = new_urls_map[key]
@@ -447,8 +503,14 @@ def main():
             if file_type == "xml":
                 xpath = st.text_input(
                     "XPath do węzła zawierającego URL-e zdjęć", 
-                    placeholder="Np. //product/image"
+                    placeholder="Np. //product/image lub //image/@url"
                 )
+                
+                st.info("""
+                **Nowość**: Teraz możesz użyć XPath wskazującego na atrybut, np. `//image/@url`.
+                Obsługiwane są również węzły z CDATA i wiele węzłów `<image>` w jednym produkcie.
+                """)
+                
                 new_node_name = st.text_input(
                     "Nazwa nowego węzła dla linków FTP", 
                     placeholder="Np. ftp_image"
