@@ -22,13 +22,26 @@ import concurrent.futures
 import queue
 import threading
 
+# Stałe konfiguracyjne
+FTP_CONFIG = {
+    'MIN_CONNECTIONS': 1,
+    'MAX_CONNECTIONS': 5,
+    'MIN_BATCH_SIZE': 2,
+    'MAX_BATCH_SIZE': 10,
+    'DEFAULT_RETRY_DELAY': 1,
+    'MAX_RETRY_DELAY': 5,
+    'CONNECTION_TIMEOUT': 60,
+    'MIN_WORKERS': 1,
+    'MAX_WORKERS': 10,
+    'DEFAULT_WORKERS': 3
+}
+
 class FTPManager:
     _instances = {}
     _lock = threading.Lock()
     
     @classmethod
     def get_instance(cls, settings):
-        # Create a key based on host, username and directory
         key = f"{settings['host']}:{settings['username']}:{settings['directory']}"
         with cls._lock:
             if key not in cls._instances:
@@ -41,31 +54,57 @@ class FTPManager:
         self.connected = False
         self.lock = threading.Lock()
         self.last_activity = time.time()
-        self.connection_limit = 2  # Max concurrent connections to same FTP server
+        self.connection_limit = FTP_CONFIG['MAX_CONNECTIONS']
         self.connection_semaphore = threading.BoundedSemaphore(self.connection_limit)
+        self.error_count = 0
+        self.last_error = None
         
+    def verify_connection(self):
+        """Weryfikuje połączenie FTP i zwraca szczegółowy status"""
+        try:
+            if not self.connect():
+                return False, "Nie można nawiązać połączenia FTP"
+                
+            # Testuj uprawnienia do zapisu
+            with tempfile.NamedTemporaryFile() as tmp:
+                tmp.write(b"test")
+                tmp.seek(0)
+                try:
+                    test_filename = f"test_{uuid.uuid4().hex[:8]}.tmp"
+                    self.ftp.storbinary(f'STOR {test_filename}', tmp)
+                    self.ftp.delete(test_filename)
+                except Exception as e:
+                    return False, f"Brak uprawnień do zapisu: {str(e)}"
+                
+            return True, "Połączenie FTP działa prawidłowo"
+        except Exception as e:
+            return False, f"Błąd weryfikacji FTP: {str(e)}"
+    
     def connect(self):
         with self.lock:
-            if self.connected and time.time() - self.last_activity < 60:
-                self.last_activity = time.time()
+            if self.connected and time.time() - self.last_activity < FTP_CONFIG['CONNECTION_TIMEOUT']:
                 return True
                 
             try:
                 if self.ftp:
                     try:
                         self.ftp.quit()
-                    except:
-                        pass
+                    except Exception as e:
+                        print(f"Błąd podczas zamykania poprzedniego połączenia: {str(e)}")
                 
                 self.ftp = ftplib.FTP()
                 self.ftp.connect(self.settings["host"], self.settings["port"])
                 self.ftp.login(self.settings["username"], self.settings["password"])
                 
+                # Optymalizacja ustawień FTP
+                self.ftp.set_pasv(True)  # Tryb pasywny często jest bardziej niezawodny
+                
                 if self.settings["directory"] and self.settings["directory"] != "/":
                     try:
                         self.ftp.cwd(self.settings["directory"])
-                    except ftplib.error_perm:
-                        for directory in [d for d in self.settings["directory"].strip("/").split("/") if d]:
+                    except ftplib.error_perm as e:
+                        dirs = [d for d in self.settings["directory"].strip("/").split("/") if d]
+                        for directory in dirs:
                             try:
                                 self.ftp.cwd(directory)
                             except ftplib.error_perm:
@@ -74,31 +113,32 @@ class FTPManager:
                 
                 self.connected = True
                 self.last_activity = time.time()
+                self.error_count = 0
                 return True
             except Exception as e:
-                print(f"FTP connection error: {str(e)}")
+                self.last_error = str(e)
+                self.error_count += 1
                 self.connected = False
-                return False
-            
+                raise
+    
     def upload_file(self, file_path, remote_filename=None, max_retries=3):
         with self.connection_semaphore:
             if not remote_filename:
                 remote_filename = os.path.basename(file_path)
                 
-            # Add a small random delay to prevent connection flood
-            time.sleep(random.uniform(0.1, 0.5))
+            # Zmniejszamy opóźnienie między próbami
+            time.sleep(random.uniform(0.05, 0.2))
             
-            # Check if file exists
             if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
                 return {"success": False, "error": f"Plik nie istnieje lub jest pusty: {file_path}"}
             
-            # Try to upload with retries
             for attempt in range(max_retries):
                 with self.lock:
                     if not self.connected and not self.connect():
                         if attempt == max_retries - 1:
-                            return {"success": False, "error": "Nie można połączyć się z serwerem FTP"}
-                        time.sleep(2 * (attempt + 1))  # Exponential backoff
+                            return {"success": False, "error": f"Nie można połączyć się z FTP: {self.last_error}"}
+                        time.sleep(min(FTP_CONFIG['MAX_RETRY_DELAY'], 
+                                    FTP_CONFIG['DEFAULT_RETRY_DELAY'] * (attempt + 1)))
                         continue
                 
                 try:
@@ -107,7 +147,7 @@ class FTPManager:
                             self.ftp.storbinary(f'STOR {remote_filename}', file)
                             self.last_activity = time.time()
 
-                    # Build URL
+                    # Buduj URL
                     if self.settings.get("http_path"):
                         http_path = self.settings["http_path"].strip()
                         if not http_path.endswith('/'): http_path += '/'
@@ -124,12 +164,16 @@ class FTPManager:
 
                     return {"success": True, "url": image_url, "filename": remote_filename}
                 except Exception as e:
-                    print(f"FTP upload error (attempt {attempt+1}): {str(e)}")
+                    print(f"Błąd wysyłania FTP (próba {attempt+1}): {str(e)}")
+                    self.last_error = str(e)
+                    self.error_count += 1
                     self.connected = False
-                    if attempt < max_retries - 1:
-                        time.sleep(2 * (attempt + 1))  # Exponential backoff
                     
-            return {"success": False, "error": f"Nie udało się przesłać pliku po {max_retries} próbach"}
+                    if attempt < max_retries - 1:
+                        time.sleep(min(FTP_CONFIG['MAX_RETRY_DELAY'], 
+                                    FTP_CONFIG['DEFAULT_RETRY_DELAY'] * (attempt + 1)))
+                    
+            return {"success": False, "error": f"Nie udało się wysłać pliku po {max_retries} próbach. Ostatni błąd: {self.last_error}"}
     
     def close(self):
         with self.lock:
@@ -144,17 +188,31 @@ class FTPBatchManager:
     aby zmniejszyć obciążenie serwera FTP i uniknąć blokowania połączeń.
     """
     
-    def __init__(self, settings, batch_size=5, max_connections=2):
+    def __init__(self, settings, max_workers):
         self.settings = settings
-        self.batch_size = batch_size
-        self.max_connections = max_connections
+        # Oblicz parametry na podstawie max_workers
+        self.batch_size = max(FTP_CONFIG['MIN_BATCH_SIZE'], 
+                            min(FTP_CONFIG['MAX_BATCH_SIZE'], max_workers * 2))
+        self.max_connections = max(FTP_CONFIG['MIN_CONNECTIONS'], 
+                                 min(FTP_CONFIG['MAX_CONNECTIONS'], max_workers))
         self.upload_queue = queue.Queue()
         self.results = {}
         self.running = False
         self.worker_thread = None
         self.lock = threading.Lock()
-        self.semaphore = threading.Semaphore(max_connections)
+        self.semaphore = threading.Semaphore(self.max_connections)
         self.ftp_manager = FTPManager.get_instance(settings)
+        self.stats = {
+            'total_uploaded': 0,
+            'failed_uploads': 0,
+            'retry_count': 0,
+            'start_time': None,
+            'last_upload_time': None
+        }
+        
+    def verify_connection(self):
+        """Weryfikuje połączenie FTP przed rozpoczęciem przetwarzania"""
+        return self.ftp_manager.verify_connection()
         
     def add_upload_task(self, file_path, callback=None):
         """Dodaje zadanie do kolejki przesyłania"""
@@ -169,6 +227,7 @@ class FTPBatchManager:
             return
             
         self.running = True
+        self.stats['start_time'] = time.time()
         self.worker_thread = threading.Thread(target=self._process_queue)
         self.worker_thread.daemon = True
         self.worker_thread.start()
@@ -185,7 +244,6 @@ class FTPBatchManager:
         """Przetwarza zadania wysyłania w kolejce"""
         while self.running:
             try:
-                # Przetwarzamy batch zadań naraz
                 batch = []
                 for _ in range(self.batch_size):
                     if self.upload_queue.empty():
@@ -193,14 +251,11 @@ class FTPBatchManager:
                     batch.append(self.upload_queue.get(block=False))
                 
                 if not batch:
-                    # Jeśli kolejka jest pusta, zrób krótką pauzę
-                    time.sleep(0.5)
+                    time.sleep(0.1)  # Zmniejszone opóźnienie
                     continue
                 
-                # Małe opóźnienie przed rozpoczęciem przesyłania batcha
-                time.sleep(random.uniform(0.2, 0.5))
+                time.sleep(random.uniform(0.1, 0.3))  # Zmniejszone opóźnienie między batchami
                 
-                # Przetwarzaj batch
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_connections) as executor:
                     futures = {executor.submit(self._upload_file, task_id, file_path): (task_id, callback) 
                               for task_id, file_path, callback in batch}
@@ -210,22 +265,32 @@ class FTPBatchManager:
                         try:
                             result = future.result()
                             self.results[task_id] = result
+                            
+                            # Aktualizuj statystyki
+                            if result.get("status") == "success":
+                                self.stats['total_uploaded'] += 1
+                            elif result.get("status") == "error":
+                                self.stats['failed_uploads'] += 1
+                            self.stats['last_upload_time'] = time.time()
+                            
                             if callback:
                                 callback(task_id, result)
                         except Exception as e:
-                            error_result = {"status": "error", "error": str(e)}
+                            error_result = {
+                                "status": "error", 
+                                "error": f"Błąd wysyłania: {str(e)}",
+                                "details": getattr(e, 'details', None)
+                            }
                             self.results[task_id] = error_result
+                            self.stats['failed_uploads'] += 1
                             if callback:
                                 callback(task_id, error_result)
                 
-                # Krótka pauza między batchami, aby serwer FTP mógł odpocząć
-                time.sleep(random.uniform(0.5, 1.0))
-                
             except queue.Empty:
-                time.sleep(0.5)
+                time.sleep(0.1)
             except Exception as e:
                 print(f"FTPBatchManager error: {str(e)}")
-                time.sleep(1)
+                time.sleep(0.5)
                 
     def _upload_file(self, task_id, file_path):
         """Przesyła pojedynczy plik na FTP"""
@@ -241,14 +306,28 @@ class FTPBatchManager:
                         "filename": upload_result["filename"]
                     }
                 else:
+                    self.stats['retry_count'] += 1
                     return {"status": "error", "error": upload_result["error"]}
             except Exception as e:
+                self.stats['retry_count'] += 1
                 return {"status": "error", "error": str(e)}
                 
     def get_result(self, task_id):
         """Pobiera wynik dla zadania"""
         with self.lock:
             return self.results.get(task_id)
+            
+    def get_stats(self):
+        """Zwraca statystyki przetwarzania"""
+        with self.lock:
+            stats = self.stats.copy()
+            if stats['start_time']:
+                stats['elapsed_time'] = time.time() - stats['start_time']
+                if stats['total_uploaded'] > 0 and stats['elapsed_time'] > 0:
+                    stats['upload_rate'] = stats['total_uploaded'] / stats['elapsed_time']
+                else:
+                    stats['upload_rate'] = 0
+            return stats
 
 # Funkcje pomocnicze
 def authenticate_user():
@@ -403,7 +482,34 @@ def download_image(url, temp_dir):
     except Exception as e:
         return None, f"Błąd: {str(e)}"
 
-def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debug_container=None, max_retries=3, progress_callback=None):
+def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, debug_container=None, max_retries=3, progress_callback=None):
+    # Użyj domyślnej wartości jeśli nie podano max_workers
+    if max_workers is None:
+        max_workers = FTP_CONFIG['DEFAULT_WORKERS']
+    
+    # Upewnij się, że max_workers jest w dozwolonym zakresie
+    max_workers = max(FTP_CONFIG['MIN_WORKERS'], 
+                     min(FTP_CONFIG['MAX_WORKERS'], max_workers))
+    
+    # Inicjalizacja FTP Batch Managera z odpowiednimi parametrami
+    ftp_batch_manager = FTPBatchManager(ftp_settings, max_workers)
+    
+    if debug_container:
+        debug_container.info(f"Konfiguracja przetwarzania:")
+        debug_container.info(f"- Max równoległych procesów: {max_workers}")
+        debug_container.info(f"- Rozmiar batcha: {ftp_batch_manager.batch_size}")
+        debug_container.info(f"- Max połączeń FTP: {ftp_batch_manager.max_connections}")
+    
+    # Weryfikacja połączenia FTP przed rozpoczęciem
+    success, message = ftp_batch_manager.verify_connection()
+    if not success:
+        if debug_container:
+            debug_container.error(f"❌ Błąd połączenia FTP: {message}")
+        return {}, [], [{"url": "all", "error": f"Błąd połączenia FTP: {message}"}]
+    
+    if debug_container:
+        debug_container.success("✅ Połączenie FTP zweryfikowane pomyślnie")
+    
     new_urls_map = {}
     downloaded_images = []
     failed_urls = []
@@ -420,8 +526,7 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
     if debug_container:
         debug_container.info(f"Inicjalizacja przetwarzania dla {total_urls} obrazów...")
     
-    # Inicjalizuj FTP Batch Manager dla efektywnego zarządzania połączeniami FTP
-    ftp_batch_manager = FTPBatchManager(ftp_settings, batch_size=5, max_connections=2)
+    # Inicjalizuj FTP Batch Manager
     ftp_batch_manager.start_processing()
     
     # Słownik do śledzenia zadań FTP
@@ -431,7 +536,7 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
     def process_single_url(url, retry_count=0):
         nonlocal processed_count
         try:
-            # Download image - dodajemy informację o aktualnej operacji
+            # Download image
             if debug_container:
                 debug_container.info(f"⬇️ Pobieranie: {url}")
                 
@@ -443,7 +548,6 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
                 else:
                     return {"status": "download_error", "url": url, "error": error}
             
-            # Zamiast bezpośredniego wysyłania na FTP, dodajemy zadanie do batch managera
             if debug_container:
                 debug_container.info(f"🔄 Dodawanie do kolejki FTP: {url}")
             
@@ -464,10 +568,22 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
             else:
                 return {"status": "error", "url": url, "error": str(e)}
     
-    # Sprawdzanie statusu zadań FTP
+    # Sprawdzanie statusu zadań FTP z uwzględnieniem statystyk
     def check_ftp_tasks():
         tasks_to_remove = []
         retry_tasks = []
+        
+        stats = ftp_batch_manager.get_stats()
+        if debug_container and stats['total_uploaded'] > 0:
+            upload_rate = stats['upload_rate']
+            elapsed_time = stats['elapsed_time']
+            debug_container.info(f"📊 Statystyki FTP:")
+            debug_container.info(f"- Przesłano: {stats['total_uploaded']}")
+            debug_container.info(f"- Błędy: {stats['failed_uploads']}")
+            debug_container.info(f"- Ponowienia: {stats['retry_count']}")
+            debug_container.info(f"- Szybkość: {upload_rate:.2f} plików/s")
+            if elapsed_time > 0:
+                debug_container.info(f"- Czas: {int(elapsed_time/60)}m {int(elapsed_time%60)}s")
         
         with ftp_results_lock:
             for url, task_data in ftp_tasks.items():
@@ -476,14 +592,11 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
                 result = ftp_batch_manager.get_result(task_id)
                 
                 if not result or result.get("status") == "queued" or result.get("status") == "uploading":
-                    # Zadanie nadal w trakcie przetwarzania
                     continue
                     
-                # Zadanie zakończone
                 tasks_to_remove.append(url)
                 
                 if result.get("status") == "success":
-                    # Zadanie zakończone sukcesem
                     new_urls_map[url] = result.get("url")
                     downloaded_images.append({
                         "original_url": url, 
@@ -495,7 +608,6 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
                     if debug_container:
                         debug_container.success(f"✅ Pobrano i przesłano: {url}")
                 else:
-                    # Zadanie zakończone błędem
                     error = result.get("error", "Nieznany błąd przesyłania")
                     if retry_count < max_retries:
                         if debug_container:
@@ -507,18 +619,16 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
                         if debug_container:
                             debug_container.warning(f"❌ Błąd przesyłania FTP dla {url}: {error}")
             
-            # Usuń przetworzone zadania
             for url in tasks_to_remove:
                 del ftp_tasks[url]
                 
-        # Dodaj zadania do ponowienia
         for url, retry_count in retry_tasks:
             retry_queue.put((url, retry_count))
     
-    # Dodajemy tylko początkowy batch URL-i zamiast wszystkich naraz
+    # Dodajemy tylko początkowy batch URL-i
     initial_batch_size = min(max_workers * 2, total_urls)
     for url in urls[:initial_batch_size]:
-        retry_queue.put((url, 0))  # (url, retry_count)
+        retry_queue.put((url, 0))
     
     next_url_index = initial_batch_size
     
@@ -539,9 +649,8 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
                 ftp_queue_size = len(ftp_tasks)
                 debug_container.info(f"📋 W kolejce pobierania: {queue_size} | W kolejce FTP: {ftp_queue_size} | Zaplanowano: {next_url_index}/{total_urls}")
             
-            # Jeśli nie ma nic w kolejce, ale są zadania FTP, czekaj na ich zakończenie
             if retry_queue.empty() and next_url_index >= total_urls and ftp_tasks:
-                time.sleep(0.5)
+                time.sleep(0.1)  # Zmniejszone opóźnienie
                 continue
             
             # Get batch of URLs from queue
@@ -552,12 +661,10 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
                     batch.append(retry_queue.get())
             
             if not batch:
-                # Jeśli nie ma więcej URL-i do przetworzenia, ale jeszcze nie wszystkie zostały dodane
                 if next_url_index < total_urls:
                     continue
-                # Jeśli nadal są zadania FTP to czekaj na ich zakończenie
                 elif ftp_tasks:
-                    time.sleep(0.5)
+                    time.sleep(0.1)  # Zmniejszone opóźnienie
                     continue
                 else:
                     break
@@ -572,7 +679,6 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
                     result = future.result()
                     
                     if result["status"] == "queued_ftp":
-                        # Zadanie zostało dodane do kolejki FTP
                         with ftp_results_lock:
                             ftp_tasks[url] = {
                                 "task_id": result["task_id"],
@@ -582,14 +688,11 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
                         if debug_container:
                             debug_container.info(f"⬆️ Zadanie FTP dodane: {url}")
                     elif result["status"] == "retry":
-                        # Add to retry queue with incremented retry counter
                         if debug_container:
                             debug_container.info(f"🔄 Ponawiam {result['retry_count']}/{max_retries} dla {url}: {result.get('error')}")
-                        # Add small delay before retry
-                        time.sleep(random.uniform(1, 2))
+                        time.sleep(random.uniform(0.5, 1.0))  # Opóźnienie przed ponowieniem
                         retry_queue.put((url, result["retry_count"]))
                     else:
-                        # Błąd pobierania
                         failed_urls.append({"url": url, "error": result.get("error", "Nieznany błąd")})
                         processed_count += 1
                         if debug_container:
@@ -597,10 +700,15 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
                 
                     # Aktualizacja postępu
                     if progress_callback and total_urls > 0:
-                        # Obliczamy rzeczywisty postęp
                         remaining = total_urls - next_url_index + retry_queue.qsize() + len(ftp_tasks)
                         progress = min(0.99, max(0.01, (total_urls - remaining) / total_urls))
-                        progress_callback(progress, processed_count, processed_count, total_urls)
+                        
+                        # Pobierz statystyki FTP
+                        stats = ftp_batch_manager.get_stats()
+                        upload_rate = stats.get('upload_rate', 0)
+                        
+                        # Aktualizuj progress z dodatkowymi informacjami
+                        progress_callback(progress, processed_count, stats['total_uploaded'], total_urls)
                 
                 except Exception as e:
                     failed_urls.append({"url": url, "error": str(e)})
@@ -1168,8 +1276,13 @@ def main():
         st.subheader("4. Pobierz zdjęcia i prześlij na FTP")
         
         if st.session_state.file_info:
-            max_workers = st.slider("Liczba równoległych procesów pobierania", min_value=1, max_value=10, value=3, 
-                                   help="Wyższa wartość przyspieszy pobieranie, ale może obciążyć łącze")
+            max_workers = st.slider(
+                "Liczba równoległych procesów pobierania", 
+                min_value=FTP_CONFIG['MIN_WORKERS'],
+                max_value=FTP_CONFIG['MAX_WORKERS'],
+                value=FTP_CONFIG['DEFAULT_WORKERS'],
+                help="Wyższa wartość przyspieszy pobieranie, ale może obciążyć łącze"
+            )
 
         if st.session_state.file_info and st.button("Pobierz zdjęcia i prześlij na FTP"):
             file_type = st.session_state.file_info["type"]
@@ -1204,7 +1317,6 @@ def main():
                         urls_unique.append(url)
                         seen.add(url)
                 
-                # Aktualizuj licznik
                 urls = urls_unique
                 st.success(f"Znaleziono {len(urls)} unikalnych URL-i zdjęć")
 
@@ -1227,33 +1339,6 @@ def main():
                     with tempfile.TemporaryDirectory() as tmpdirname:
                         status_text.text(f"Inicjalizacja przetwarzania {len(urls)} obrazów...")
                         
-                        # Pre-inicjalizacja FTP dla szybszego startu
-                        if debug_area:
-                            debug_area.info("Przygotowanie połączenia FTP...")
-                        try:
-                            ftp_manager = FTPManager.get_instance(st.session_state.ftp_settings)
-                            ftp_manager.connect()
-                        except Exception as e:
-                            if debug_area:
-                                debug_area.warning(f"Problem z wstępnym połączeniem FTP: {str(e)}")
-                        
-                        # Funkcja aktualizacji postępu z większą ilością szczegółów
-                        def update_progress(progress_value, processed, total_processed, total):
-                            progress_bar.progress(progress_value)
-                            percent = int(progress_value*100)
-                            elapsed_time = time.time() - start_time
-                            
-                            if processed > 0 and elapsed_time > 0:
-                                speed = processed / elapsed_time
-                                remaining = (total - processed) / speed if speed > 0 else 0
-                                time_info = f" | ~{int(remaining/60)}m {int(remaining%60)}s pozostało"
-                                speed_info = f" | {speed:.1f} obrazów/s"
-                            else:
-                                time_info = ""
-                                speed_info = ""
-                            
-                            status_text.text(f"Przetwarzanie... {total_processed}/{total} ({percent}%){speed_info}{time_info}")
-                        
                         # Mierzenie czasu wykonania
                         start_time = time.time()
                         
@@ -1265,7 +1350,12 @@ def main():
                             max_workers=max_workers,
                             debug_container=debug_area,
                             max_retries=3,
-                            progress_callback=update_progress
+                            progress_callback=lambda progress, processed, uploaded, total: status_text.text(
+                                f"Przetwarzanie... {processed}/{total} ({int(progress*100)}%) | "
+                                f"Przesłano na FTP: {uploaded} | "
+                                f"Szybkość: {uploaded/(time.time()-start_time):.1f} obrazów/s | "
+                                f"~{int((total-processed)/(processed/(time.time()-start_time))/60)}m pozostało"
+                            ) if processed > 0 else status_text.text(f"Przetwarzanie... {processed}/{total} (0%)")
                         )
                         
                         # Zakończenie przetwarzania
@@ -1363,7 +1453,12 @@ def main():
                     format_func=lambda x: f"{next((s['timestamp'] for s in saved_sessions if s['session_id'] == x), '')} - {next((s['file_info'] for s in saved_sessions if s['session_id'] == x), '')}"
                 )
                 
-                max_workers_resume = st.slider("Liczba równoległych procesów", min_value=1, max_value=10, value=3)
+                max_workers_resume = st.slider(
+                    "Liczba równoległych procesów", 
+                    min_value=FTP_CONFIG['MIN_WORKERS'],
+                    max_value=FTP_CONFIG['MAX_WORKERS'],
+                    value=FTP_CONFIG['DEFAULT_WORKERS']
+                )
                 
                 if st.button("Wznów przetwarzanie"):
                     state = load_processing_state(selected_session_id)
