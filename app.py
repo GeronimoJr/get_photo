@@ -10,7 +10,6 @@ from pydrive2.drive import GoogleDrive
 from oauth2client.service_account import ServiceAccountCredentials
 
 logging.basicConfig(
-    filename=os.path.join(tempfile.gettempdir(), "app.log"),
     level=logging.INFO,
     format="%(asctime)s %(levelname)s:%(message)s"
 )
