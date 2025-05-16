@@ -1247,8 +1247,8 @@ def make_progress_callback(start_time, progress_bar, status_text, processed_offs
 
 def main():
     st.set_page_config(page_title="Pobieranie zdjęć z XML/CSV", layout="centered")
-    authenticate_user()
     initialize_session_state()
+    authenticate_user()
     st.title("Pobieranie zdjęć z XML/CSV")
     tab1, tab2, tab3 = st.tabs(["Pobieranie zdjęć", "Wznów przetwarzanie", "Pomoc"])
     with tab1:
