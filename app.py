@@ -512,16 +512,44 @@ def download_image(url, temp_dir):
         # Specjalna obsługa dla image_show.php
         if "image_show.php" in url:
             try:
-                html_resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+                # Zwiększ timeout dla powolnych serwerów
+                html_resp = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
                 html_resp.raise_for_status()
                 
+                # Używamy BeautifulSoup do parsowania HTML
                 soup = BeautifulSoup(html_resp.text, "html.parser")
                 img_tag = soup.find("img")
+                
+                # Jeśli nie ma tagu <img>, spróbujmy inne podejście
                 if not img_tag or not img_tag.get("src"):
-                    return None, "Nie znaleziono znacznika <img> w odpowiedzi HTML"
-
-                img_src = img_tag["src"]
-                img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}" if not img_src.startswith("http") else img_src
+                    # Sprawdź czy jest przekierowanie w meta tag
+                    meta_refresh = soup.find("meta", attrs={"http-equiv": "refresh"})
+                    if meta_refresh and meta_refresh.get("content"):
+                        content = meta_refresh.get("content")
+                        url_match = re.search(r'URL=([^"]+)', content, re.IGNORECASE)
+                        if url_match:
+                            img_url = url_match.group(1)
+                            if not img_url.startswith("http"):
+                                img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_url.lstrip('/')}"
+                        else:
+                            return None, "Nie znaleziono przekierowania w meta refresh tag"
+                    else:
+                        # Sprawdzamy, czy nie ma obrazu jako tło 
+                        body_style = soup.find("body")
+                        if body_style and body_style.get("style"):
+                            style = body_style.get("style")
+                            url_match = re.search(r'url\([\'"]?([^\'")]+)', style)
+                            if url_match:
+                                img_url = url_match.group(1)
+                                if not img_url.startswith("http"):
+                                    img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_url.lstrip('/')}"
+                            else:
+                                return None, "Nie znaleziono obrazu w stylu body"
+                        else:
+                            return None, "Nie znaleziono znacznika <img> ani alternatywnych źródeł obrazu"
+                else:
+                    img_src = img_tag["src"]
+                    img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}" if not img_src.startswith("http") else img_src
             except requests.exceptions.RequestException as e:
                 return None, f"Błąd pobierania strony HTML: {str(e)}"
         else:
@@ -530,7 +558,8 @@ def download_image(url, temp_dir):
         # Próby pobrania obrazu z obsługą różnych scenariuszy
         for retry in range(3):
             try:
-                response = requests.get(img_url, headers=headers, stream=True, timeout=15, allow_redirects=True)
+                # Zwiększ timeout dla powolnych serwerów
+                response = requests.get(img_url, headers=headers, stream=True, timeout=30, allow_redirects=True)
                 response.raise_for_status()
                 
                 # Sprawdź typ zawartości
@@ -567,11 +596,19 @@ def download_image(url, temp_dir):
                 filename = f"image_{uuid.uuid4().hex}{extension}"
                 file_path = os.path.join(temp_dir, filename)
                 
-                # Zapisz plik z weryfikacją rozmiaru
+                # Zapisz plik z weryfikacją rozmiaru - używaj chunked download
                 with open(file_path, "wb") as f:
+                    downloaded = 0
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            # Sprawdź czy plik nie jest za duży podczas pobierania
+                            if downloaded > 20 * 1024 * 1024:  # 20MB limit
+                                f.close()
+                                os.remove(file_path)
+                                return None, "Plik jest zbyt duży (>20MB)"
                 
                 # Sprawdź czy plik został poprawnie zapisany
                 if os.path.exists(file_path):
@@ -605,22 +642,35 @@ def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_c
         image_info, error = download_image(url, temp_dir)
         
         if error:
+            # Dodane bardziej szczegółowe komunikaty dla częstych błędów
+            if "image_show.php" in url and "Nie znaleziono znacznika" in error:
+                specific_error = f"Problem z parsowaniem HTML: {error}"
+            elif "timeout" in error.lower():
+                specific_error = f"Timeout podczas pobierania: {error}"
+            elif "connection" in error.lower():
+                specific_error = f"Problem z połączeniem: {error}"
+            else:
+                specific_error = error
+                
             if retry_count < max_retries:
+                # Zwiększ czas oczekiwania między kolejnymi próbami
+                wait_time = 1 + retry_count * 2  # 1s, 3s, 5s...
                 if debug_container:
-                    debug_container.info(f"🔄 Ponawiam {retry_count + 1}/{max_retries} dla {url}: {error}")
+                    debug_container.info(f"🔄 Ponawiam {retry_count + 1}/{max_retries} dla {url}: {specific_error} (czekam {wait_time}s)")
+                time.sleep(wait_time)
                 return {
                     "status": "retry",
                     "url": url,
                     "retry_count": retry_count + 1,
-                    "error": error
+                    "error": specific_error
                 }
             else:
                 if debug_container:
-                    debug_container.warning(f"❌ Błąd pobierania dla {url}: {error}")
+                    debug_container.warning(f"❌ Błąd pobierania dla {url}: {specific_error}")
                 return {
                     "status": "error",
                     "url": url,
-                    "error": error
+                    "error": specific_error
                 }
         
         if not image_info or not image_info.get("path"):
@@ -640,22 +690,26 @@ def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_c
         }
         
     except Exception as e:
+        # Poprawiona obsługa wyjątków
+        exception_details = f"{type(e).__name__}: {str(e)}"
         if retry_count < max_retries:
+            wait_time = 1 + retry_count * 2
             if debug_container:
-                debug_container.info(f"🔄 Ponawiam {retry_count + 1}/{max_retries} dla {url}: {str(e)}")
+                debug_container.info(f"🔄 Ponawiam {retry_count + 1}/{max_retries} dla {url}: {exception_details} (czekam {wait_time}s)")
+            time.sleep(wait_time)
             return {
                 "status": "retry",
                 "url": url,
                 "retry_count": retry_count + 1,
-                "error": str(e)
+                "error": exception_details
             }
         else:
             if debug_container:
-                debug_container.error(f"⛔ Błąd dla {url}: {str(e)}")
+                debug_container.error(f"⛔ Błąd dla {url}: {exception_details}")
             return {
                 "status": "error",
                 "url": url,
-                "error": str(e)
+                "error": exception_details
             }
 
 def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, debug_container=None, max_retries=3, progress_callback=None):
@@ -717,33 +771,55 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
         with ftp_results_lock:
             for url, task_info in ftp_tasks.items():
                 result = ftp_batch_manager.get_result(task_info["task_id"])
-                if result:
-                    if result["status"] == "success":
-                        new_urls_map[url] = result["url"]
-                        downloaded_images.append({
-                            "original_url": url,
-                            "ftp_url": result["url"],
-                            "filename": result["filename"]
-                        })
+                if not result:
+                    # Zadanie jeszcze nie zakończone
+                    continue
+                    
+                if result["status"] == "success":
+                    new_urls_map[url] = result["url"]
+                    downloaded_images.append({
+                        "original_url": url,
+                        "ftp_url": result["url"],
+                        "filename": result["filename"]
+                    })
+                    completed_tasks.append(url)
+                    processed_count += 1
+                    if debug_container:
+                        debug_container.success(f"✅ FTP zakończone: {url}")
+                elif result["status"] == "error":
+                    # Bardziej szczegółowa diagnostyka błędów FTP
+                    error_details = result.get("error", "Nieznany błąd FTP")
+                    if "connection" in error_details.lower():
+                        error_category = "Błąd połączenia FTP"
+                    elif "permission" in error_details.lower() or "access" in error_details.lower():
+                        error_category = "Błąd uprawnień FTP"
+                    elif "disk" in error_details.lower() or "space" in error_details.lower():
+                        error_category = "Błąd przestrzeni dyskowej"
+                    else:
+                        error_category = "Błąd FTP"
+                        
+                    if task_info["retry_count"] < max_retries:
+                        new_retry_count = task_info["retry_count"] + 1
+                        # Zwiększ czas oczekiwania między próbami
+                        wait_time = min(5, 1 * (new_retry_count))
+                        time.sleep(wait_time)
+                        
+                        retry_queue.put((url, new_retry_count))
+                        completed_tasks.append(url)
+                        
+                        if debug_container:
+                            debug_container.warning(f"🔄 Ponawiam FTP {new_retry_count}/{max_retries} dla {url}: {error_details}")
+                    else:
+                        failed_urls.append({"url": url, "error": f"{error_category}: {error_details}"})
                         completed_tasks.append(url)
                         processed_count += 1
                         if debug_container:
-                            debug_container.success(f"✅ FTP zakończone: {url}")
-                    elif result["status"] == "error":
-                        if task_info["retry_count"] < max_retries:
-                            retry_queue.put((url, task_info["retry_count"] + 1))
-                            if debug_container:
-                                debug_container.warning(f"🔄 Ponawiam FTP {task_info['retry_count'] + 1}/{max_retries} dla {url}: {result['error']}")
-                        else:
-                            failed_urls.append({"url": url, "error": f"Błąd FTP: {result['error']}"})
-                            completed_tasks.append(url)
-                            processed_count += 1
-                            if debug_container:
-                                debug_container.error(f"❌ FTP nieudane: {url}: {result['error']}")
+                            debug_container.error(f"❌ FTP nieudane: {url}: {error_details}")
             
             # Usuń zakończone zadania
             for url in completed_tasks:
-                del ftp_tasks[url]
+                if url in ftp_tasks:
+                    del ftp_tasks[url]
     
     # Dodajemy tylko początkowy batch URL-i
     initial_batch_size = min(max_workers * 2, total_urls)
@@ -875,23 +951,42 @@ def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
         xpath_base = xpath_expression.split('/@')[0] if is_attribute else xpath_expression
 
         # Wyrażenia regularne dla najczęstszych przypadków
-        if xpath_base in ["//product/image", "product/image"]:
+        if xpath_base in ["//product/image", "product/image", "//image", "/image"]:
             try:
+                # Ulepszone wyrażenia regularne dla różnych formatów
                 pattern_simple = re.compile(r'<image>(.*?)</image>', re.DOTALL)
                 pattern_cdata = re.compile(r'<image><!\[CDATA\[(.*?)\]\]></image>', re.DOTALL)
+                pattern_with_attribs = re.compile(r'<image [^>]*?>(.*?)</image>', re.DOTALL)
                 
-                matches = pattern_simple.findall(xml_content) + pattern_cdata.findall(xml_content)
+                matches = pattern_simple.findall(xml_content) + pattern_cdata.findall(xml_content) + pattern_with_attribs.findall(xml_content)
+                
                 urls = []
                 for match in matches:
                     match = match.strip()
-                    if match and ('http://' in match or 'https://' in match):
+                    if not match:
+                        continue
+                    
+                    # Znajdź URL-e w treści
+                    url_pattern = re.compile(r'https?://[^\s<>"\']+')
+                    found_urls = url_pattern.findall(match)
+                    
+                    if found_urls:
+                        for url in found_urls:
+                            clean_url = url.replace('&amp;', '&')
+                            urls.append(clean_url)
+                    elif 'http://' in match or 'https://' in match:
                         urls.append(match.replace('&amp;', '&'))
-                return urls, None
+                
+                if urls:
+                    return urls, None
             except Exception as e:
-                return None, f"Błąd przy parsowaniu XML: {str(e)}"
+                return None, f"Błąd przy parsowaniu XML wyrażeniami regularnymi: {str(e)}"
 
         # ElementTree dla innych przypadków
         try:
+            # Próbuj naprawić częste problemy w XML
+            xml_content = re.sub(r'&(?!amp;|lt;|gt;|apos;|quot;)', '&amp;', xml_content)
+            
             root = ET.fromstring(xml_content)
             xpath = f"./{xpath_base[2:]}" if xpath_base.startswith('//') else f"./{xpath_base}" if not xpath_base.startswith('./') else xpath_base
             elements = root.findall(xpath)
@@ -901,12 +996,29 @@ def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
                 element_text = element.attrib.get(attribute_name) if is_attribute else element.text
                 if element_text:
                     element_text = element_text.replace('&amp;', '&')
+                    
+                    # Sprawdź, czy tekst zawiera URL-e
                     if 'http://' in element_text or 'https://' in element_text:
                         if separator in element_text:
-                            urls.extend([url.strip() for url in element_text.split(separator) 
-                                       if url.strip() and ('http://' in url or 'https://' in url)])
+                            found_urls = [url.strip() for url in element_text.split(separator) 
+                                        if url.strip() and ('http://' in url or 'https://' in url)]
+                            urls.extend(found_urls)
                         else:
                             urls.append(element_text.strip())
+            
+            # Jeśli nie znaleziono URL-i, spróbuj bardziej generyczne podejście
+            if not urls:
+                # Znajdź wszystkie elementy z tekstem zawierającym http
+                for elem in root.iter():
+                    if elem.text and ('http://' in elem.text or 'https://' in elem.text):
+                        element_text = elem.text.replace('&amp;', '&')
+                        if separator in element_text:
+                            found_urls = [url.strip() for url in element_text.split(separator) 
+                                        if url.strip() and ('http://' in url or 'https://' in url)]
+                            urls.extend(found_urls)
+                        else:
+                            urls.append(element_text.strip())
+            
             return urls, None
         except ET.ParseError as e:
             return None, f"Błąd przy parsowaniu XML: {str(e)}"
