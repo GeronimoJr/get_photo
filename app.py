@@ -301,6 +301,8 @@ def extract_image_urls_from_xml(xml_content, xpath_expression, separator=","):
         return None, f"Nieoczekiwany błąd: {str(e)}"
 
 def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_node_name):
+    import xml.etree.ElementTree as ET
+
     try:
         if not xml_content or not xml_content.strip():
             return None, "Plik XML jest pusty"
@@ -308,44 +310,45 @@ def update_xml_with_new_urls(xml_content, xpath_expression, new_urls_map, new_no
         if not new_node_name or not new_node_name.strip():
             return None, "Nazwa nowego węzła nie może być pusta"
 
-        if xml_content.startswith("\ufeff"):
-            xml_content = xml_content[1:]
+        # Parse XML
+        root = ET.fromstring(xml_content)
 
-        xml_content = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", xml_content)
+        # Normalize xpath expression
+        if xpath_expression.startswith('//'):
+            xpath_expression = xpath_expression[2:]  # e.g., 'product/image'
 
-        if xpath_expression == "//product/image" or xpath_expression == "product/image":
-            try:
-                updated_xml = xml_content
+        elements = root.findall(f'.//{xpath_expression}')
 
-                for original_url, new_url in new_urls_map.items():
-                    escaped_url = re.escape(original_url)
-                    pattern = f"(<image>{escaped_url}</image>)"
-                    check_pattern = f"<image>{escaped_url}</image>\\s*<{new_node_name}>"
-                    if not re.search(check_pattern, updated_xml):
-                        replacement = f"\\1\n<{new_node_name}>{new_url}</{new_node_name}>"
-                        updated_xml = re.sub(pattern, replacement, updated_xml)
+        for element in elements:
+            original_url = element.text.strip() if element.text else ""
+            if original_url in new_urls_map:
+                new_url = new_urls_map[original_url]
 
-                return updated_xml, None
-            except Exception as e:
-                return None, f"Błąd podczas aktualizacji XML z wyrażeniami regularnymi: {str(e)}"
+                # Get parent node to insert new child
+                parent = element.getparent() if hasattr(element, "getparent") else None
+                if parent is None:
+                    # Attempt to find parent manually
+                    for potential_parent in root.iter():
+                        if element in list(potential_parent):
+                            parent = potential_parent
+                            break
 
-        try:
-            # Używamy alternatywnego podejścia z wyrażeniami regularnymi
-            updated_xml = xml_content
-            node_name = xpath_expression.split("/")[-1]
-            
-            for original_url, new_url in new_urls_map.items():
-                escaped_url = re.escape(original_url)
-                pattern = f"(<{node_name}>{escaped_url}</{node_name}>)"
-                check_pattern = f"<{node_name}>{escaped_url}</{node_name}>\\s*<{new_node_name}>"
-                if not re.search(check_pattern, updated_xml):
-                    replacement = f"\\1\n<{new_node_name}>{new_url}</{new_node_name}>"
-                    updated_xml = re.sub(pattern, replacement, updated_xml)
+                # Check if the new node already exists
+                if parent is not None:
+                    already_exists = any(
+                        sibling.tag == new_node_name and sibling.text == new_url
+                        for sibling in parent
+                    )
+                    if not already_exists:
+                        new_elem = ET.Element(new_node_name)
+                        new_elem.text = new_url
+                        parent.append(new_elem)
 
-            return updated_xml, None
-        except Exception as e:
-            return None, f"Błąd podczas aktualizacji XML: {str(e)}"
+        updated_xml = ET.tostring(root, encoding="unicode")
+        return updated_xml, None
 
+    except ET.ParseError as e:
+        return None, f"Błąd podczas parsowania XML: {str(e)}"
     except Exception as e:
         return None, f"Nieoczekiwany błąd: {str(e)}"
 
