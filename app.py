@@ -138,6 +138,118 @@ class FTPManager:
                 except: pass
                 self.connected = False
 
+class FTPBatchManager:
+    """
+    Manager do wykonywania operacji FTP w batchach,
+    aby zmniejszyć obciążenie serwera FTP i uniknąć blokowania połączeń.
+    """
+    
+    def __init__(self, settings, batch_size=5, max_connections=2):
+        self.settings = settings
+        self.batch_size = batch_size
+        self.max_connections = max_connections
+        self.upload_queue = queue.Queue()
+        self.results = {}
+        self.running = False
+        self.worker_thread = None
+        self.lock = threading.Lock()
+        self.semaphore = threading.Semaphore(max_connections)
+        self.ftp_manager = FTPManager.get_instance(settings)
+        
+    def add_upload_task(self, file_path, callback=None):
+        """Dodaje zadanie do kolejki przesyłania"""
+        task_id = str(uuid.uuid4())
+        self.upload_queue.put((task_id, file_path, callback))
+        self.results[task_id] = {"status": "queued", "file_path": file_path}
+        return task_id
+        
+    def start_processing(self):
+        """Rozpoczyna przetwarzanie zadań w osobnym wątku"""
+        if self.running:
+            return
+            
+        self.running = True
+        self.worker_thread = threading.Thread(target=self._process_queue)
+        self.worker_thread.daemon = True
+        self.worker_thread.start()
+        
+    def stop_processing(self):
+        """Zatrzymuje przetwarzanie zadań"""
+        self.running = False
+        if self.worker_thread:
+            if self.worker_thread.is_alive():
+                self.worker_thread.join(timeout=3)
+            self.worker_thread = None
+            
+    def _process_queue(self):
+        """Przetwarza zadania wysyłania w kolejce"""
+        while self.running:
+            try:
+                # Przetwarzamy batch zadań naraz
+                batch = []
+                for _ in range(self.batch_size):
+                    if self.upload_queue.empty():
+                        break
+                    batch.append(self.upload_queue.get(block=False))
+                
+                if not batch:
+                    # Jeśli kolejka jest pusta, zrób krótką pauzę
+                    time.sleep(0.5)
+                    continue
+                
+                # Małe opóźnienie przed rozpoczęciem przesyłania batcha
+                time.sleep(random.uniform(0.2, 0.5))
+                
+                # Przetwarzaj batch
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_connections) as executor:
+                    futures = {executor.submit(self._upload_file, task_id, file_path): (task_id, callback) 
+                              for task_id, file_path, callback in batch}
+                    
+                    for future in concurrent.futures.as_completed(futures):
+                        task_id, callback = futures[future]
+                        try:
+                            result = future.result()
+                            self.results[task_id] = result
+                            if callback:
+                                callback(task_id, result)
+                        except Exception as e:
+                            error_result = {"status": "error", "error": str(e)}
+                            self.results[task_id] = error_result
+                            if callback:
+                                callback(task_id, error_result)
+                
+                # Krótka pauza między batchami, aby serwer FTP mógł odpocząć
+                time.sleep(random.uniform(0.5, 1.0))
+                
+            except queue.Empty:
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"FTPBatchManager error: {str(e)}")
+                time.sleep(1)
+                
+    def _upload_file(self, task_id, file_path):
+        """Przesyła pojedynczy plik na FTP"""
+        with self.semaphore:
+            try:
+                self.results[task_id] = {"status": "uploading"}
+                upload_result = self.ftp_manager.upload_file(file_path)
+                
+                if upload_result["success"]:
+                    return {
+                        "status": "success", 
+                        "url": upload_result["url"], 
+                        "filename": upload_result["filename"]
+                    }
+                else:
+                    return {"status": "error", "error": upload_result["error"]}
+            except Exception as e:
+                return {"status": "error", "error": str(e)}
+                
+    def get_result(self, task_id):
+        """Pobiera wynik dla zadania"""
+        with self.lock:
+            return self.results.get(task_id)
+
 # Funkcje pomocnicze
 def authenticate_user():
     if "authenticated" not in st.session_state:
@@ -301,9 +413,28 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
     total_urls = len(urls)
     processed_count = 0
     
+    # Inicjalizacja postępu - pokaż 0% na starcie
+    if progress_callback:
+        progress_callback(0, 0, 0, total_urls)
+        
+    if debug_container:
+        debug_container.info(f"Inicjalizacja przetwarzania dla {total_urls} obrazów...")
+    
+    # Inicjalizuj FTP Batch Manager dla efektywnego zarządzania połączeniami FTP
+    ftp_batch_manager = FTPBatchManager(ftp_settings, batch_size=5, max_connections=2)
+    ftp_batch_manager.start_processing()
+    
+    # Słownik do śledzenia zadań FTP
+    ftp_tasks = {}
+    ftp_results_lock = threading.Lock()
+    
     def process_single_url(url, retry_count=0):
+        nonlocal processed_count
         try:
-            # Download image
+            # Download image - dodajemy informację o aktualnej operacji
+            if debug_container:
+                debug_container.info(f"⬇️ Pobieranie: {url}")
+                
             image_info, error = download_image(url, temp_dir)
             if error:
                 if retry_count < max_retries:
@@ -312,23 +443,20 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
                 else:
                     return {"status": "download_error", "url": url, "error": error}
             
-            # Get FTP manager instance (reuse connections)
-            ftp_manager = FTPManager.get_instance(ftp_settings)
+            # Zamiast bezpośredniego wysyłania na FTP, dodajemy zadanie do batch managera
+            if debug_container:
+                debug_container.info(f"🔄 Dodawanie do kolejki FTP: {url}")
             
-            # Upload file
-            upload_result = ftp_manager.upload_file(image_info["path"])
+            # Dodaj zadanie do kolejki FTP i zapamiętaj ID zadania
+            task_id = ftp_batch_manager.add_upload_task(image_info["path"])
             
-            if upload_result["success"]:
-                return {
-                    "status": "success", "url": url, "ftp_url": upload_result["url"],
-                    "filename": upload_result["filename"], "path": image_info["path"]
-                }
-            else:
-                if retry_count < max_retries:
-                    return {"status": "retry", "url": url, "retry_count": retry_count + 1, 
-                            "error": f"Upload error: {upload_result['error']}"}
-                else:
-                    return {"status": "upload_error", "url": url, "error": upload_result["error"]}
+            return {
+                "status": "queued_ftp", 
+                "url": url,
+                "task_id": task_id, 
+                "file_path": image_info["path"],
+                "retry_count": retry_count
+            }
         except Exception as e:
             if retry_count < max_retries:
                 return {"status": "retry", "url": url, "retry_count": retry_count + 1, 
@@ -336,66 +464,152 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=5, debu
             else:
                 return {"status": "error", "url": url, "error": str(e)}
     
-    # Add all URLs to the queue initially
-    for url in urls:
+    # Sprawdzanie statusu zadań FTP
+    def check_ftp_tasks():
+        tasks_to_remove = []
+        retry_tasks = []
+        
+        with ftp_results_lock:
+            for url, task_data in ftp_tasks.items():
+                task_id = task_data["task_id"]
+                retry_count = task_data["retry_count"]
+                result = ftp_batch_manager.get_result(task_id)
+                
+                if not result or result.get("status") == "queued" or result.get("status") == "uploading":
+                    # Zadanie nadal w trakcie przetwarzania
+                    continue
+                    
+                # Zadanie zakończone
+                tasks_to_remove.append(url)
+                
+                if result.get("status") == "success":
+                    # Zadanie zakończone sukcesem
+                    new_urls_map[url] = result.get("url")
+                    downloaded_images.append({
+                        "original_url": url, 
+                        "ftp_url": result.get("url"),
+                        "filename": result.get("filename")
+                    })
+                    nonlocal processed_count
+                    processed_count += 1
+                    if debug_container:
+                        debug_container.success(f"✅ Pobrano i przesłano: {url}")
+                else:
+                    # Zadanie zakończone błędem
+                    error = result.get("error", "Nieznany błąd przesyłania")
+                    if retry_count < max_retries:
+                        if debug_container:
+                            debug_container.info(f"🔄 Ponawiam FTP {retry_count+1}/{max_retries} dla {url}: {error}")
+                        retry_tasks.append((url, retry_count + 1))
+                    else:
+                        failed_urls.append({"url": url, "error": error})
+                        processed_count += 1
+                        if debug_container:
+                            debug_container.warning(f"❌ Błąd przesyłania FTP dla {url}: {error}")
+            
+            # Usuń przetworzone zadania
+            for url in tasks_to_remove:
+                del ftp_tasks[url]
+                
+        # Dodaj zadania do ponowienia
+        for url, retry_count in retry_tasks:
+            retry_queue.put((url, retry_count))
+    
+    # Dodajemy tylko początkowy batch URL-i zamiast wszystkich naraz
+    initial_batch_size = min(max_workers * 2, total_urls)
+    for url in urls[:initial_batch_size]:
         retry_queue.put((url, 0))  # (url, retry_count)
     
-    # Process until queue is empty
+    next_url_index = initial_batch_size
+    
+    # Process until queue is empty and all URLs are processed
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        progress_interval = max(1, total_urls // 10)  # Update progress every 10%
-        last_progress = 0
-
-        while not retry_queue.empty():
+        while not retry_queue.empty() or next_url_index < total_urls or ftp_tasks:
+            # Sprawdź status zadań FTP
+            check_ftp_tasks()
+            
+            # Dodajemy więcej URL-i do kolejki w miarę potrzeby
+            while next_url_index < total_urls and retry_queue.qsize() < max_workers * 2:
+                retry_queue.put((urls[next_url_index], 0))
+                next_url_index += 1
+                
+            # Informacja o stanie kolejki
+            queue_size = retry_queue.qsize()
+            if debug_container and (next_url_index < total_urls or queue_size > 0 or ftp_tasks):
+                ftp_queue_size = len(ftp_tasks)
+                debug_container.info(f"📋 W kolejce pobierania: {queue_size} | W kolejce FTP: {ftp_queue_size} | Zaplanowano: {next_url_index}/{total_urls}")
+            
+            # Jeśli nie ma nic w kolejce, ale są zadania FTP, czekaj na ich zakończenie
+            if retry_queue.empty() and next_url_index >= total_urls and ftp_tasks:
+                time.sleep(0.5)
+                continue
+            
             # Get batch of URLs from queue
-            batch_size = min(max_workers, retry_queue.qsize())
             batch = []
+            batch_size = min(max_workers, queue_size)
             for _ in range(batch_size):
                 if not retry_queue.empty():
                     batch.append(retry_queue.get())
             
+            if not batch:
+                # Jeśli nie ma więcej URL-i do przetworzenia, ale jeszcze nie wszystkie zostały dodane
+                if next_url_index < total_urls:
+                    continue
+                # Jeśli nadal są zadania FTP to czekaj na ich zakończenie
+                elif ftp_tasks:
+                    time.sleep(0.5)
+                    continue
+                else:
+                    break
+            
             # Process batch
-            futures = {executor.submit(process_single_url, url, retry_count): url 
+            futures = {executor.submit(process_single_url, url, retry_count): (url, retry_count) 
                       for url, retry_count in batch}
             
             for future in concurrent.futures.as_completed(futures):
-                url = futures[future]
+                url, retry_count = futures[future]
                 try:
                     result = future.result()
                     
-                    if result["status"] == "success":
-                        new_urls_map[url] = result["ftp_url"]
-                        downloaded_images.append({
-                            "original_url": url, "ftp_url": result["ftp_url"],
-                            "filename": result["filename"]
-                        })
-                        processed_count += 1
+                    if result["status"] == "queued_ftp":
+                        # Zadanie zostało dodane do kolejki FTP
+                        with ftp_results_lock:
+                            ftp_tasks[url] = {
+                                "task_id": result["task_id"],
+                                "file_path": result["file_path"],
+                                "retry_count": retry_count
+                            }
                         if debug_container:
-                            debug_container.success(f"Pobrano i przesłano: {url}")
+                            debug_container.info(f"⬆️ Zadanie FTP dodane: {url}")
                     elif result["status"] == "retry":
                         # Add to retry queue with incremented retry counter
                         if debug_container:
-                            debug_container.info(f"Ponawiam {result['retry_count']}/{max_retries} dla {url}: {result.get('error')}")
+                            debug_container.info(f"🔄 Ponawiam {result['retry_count']}/{max_retries} dla {url}: {result.get('error')}")
                         # Add small delay before retry
-                        time.sleep(random.uniform(1, 3))
+                        time.sleep(random.uniform(1, 2))
                         retry_queue.put((url, result["retry_count"]))
                     else:
+                        # Błąd pobierania
                         failed_urls.append({"url": url, "error": result.get("error", "Nieznany błąd")})
                         processed_count += 1
                         if debug_container:
-                            debug_container.warning(f"Błąd dla {url}: {result.get('error')}")
+                            debug_container.warning(f"❌ Błąd dla {url}: {result.get('error')}")
                 
-                    # Update progress periodically
-                    if progress_callback and total_urls > 0 and (processed_count - last_progress >= progress_interval):
-                        last_progress = processed_count
-                        remaining = retry_queue.qsize()
-                        progress = (total_urls - remaining) / total_urls
-                        progress_callback(progress, processed_count, total_urls - remaining, total_urls)
+                    # Aktualizacja postępu
+                    if progress_callback and total_urls > 0:
+                        # Obliczamy rzeczywisty postęp
+                        remaining = total_urls - next_url_index + retry_queue.qsize() + len(ftp_tasks)
+                        progress = min(0.99, max(0.01, (total_urls - remaining) / total_urls))
+                        progress_callback(progress, processed_count, processed_count, total_urls)
                 
                 except Exception as e:
                     failed_urls.append({"url": url, "error": str(e)})
                     processed_count += 1
                     if debug_container:
-                        debug_container.error(f"Wyjątek dla {url}: {str(e)}")
+                        debug_container.error(f"⛔ Wyjątek dla {url}: {str(e)}")
+    
+    # Zatrzymaj FTP Batch Manager
+    ftp_batch_manager.stop_processing()
     
     # Final progress update
     if progress_callback and total_urls > 0:
@@ -748,13 +962,40 @@ def resume_processing(state, temp_dir, ftp_settings, max_workers=5):
     debug_area = st.empty()
     
     total_to_process = len(remaining_urls)
-    status_text.text(f"Wznawianie przetwarzania {len(remaining_urls)} pozostałych obrazów z {state['total_urls']} w sumie...")
+    status_text.text(f"Inicjalizacja wznawiania przetwarzania {len(remaining_urls)} pozostałych obrazów...")
     
-    # Funkcja aktualizacji postępu
+    # Pre-inicjalizacja FTP dla szybszego startu
+    if debug_area:
+        debug_area.info("Przygotowanie połączenia FTP...")
+    try:
+        ftp_manager = FTPManager.get_instance(ftp_settings)
+        ftp_manager.connect()
+    except Exception as e:
+        if debug_area:
+            debug_area.warning(f"Problem z wstępnym połączeniem FTP: {str(e)}")
+            
+    # Mierzenie czasu wykonania
+    start_time = time.time()
+    
+    # Funkcja aktualizacji postępu z większą ilością szczegółów
     def update_progress(progress_value, processed, total_processed, total):
+        # Oblicz całkowity progres uwzględniając już przetworzone obrazy
         overall_progress = (len(state["processed_urls"]) + total_processed) / state["total_urls"]
         progress_bar.progress(overall_progress)
-        status_text.text(f"Przetwarzanie... {total_processed}/{total} obrazów ({int(progress_value*100)}%)")
+        
+        percent = int(progress_value*100)
+        elapsed_time = time.time() - start_time
+        
+        if processed > 0 and elapsed_time > 0:
+            speed = processed / elapsed_time
+            remaining = (total - processed) / speed if speed > 0 else 0
+            time_info = f" | ~{int(remaining/60)}m {int(remaining%60)}s pozostało"
+            speed_info = f" | {speed:.1f} obrazów/s"
+        else:
+            time_info = ""
+            speed_info = ""
+            
+        status_text.text(f"Przetwarzanie... {total_processed}/{total} ({percent}%){speed_info}{time_info}")
     
     # Use our improved parallel processing function
     batch_result, batch_downloaded, failed_urls = process_images_in_parallel(
@@ -984,12 +1225,37 @@ def main():
                     session_id = f"{uuid.uuid4().hex}_{int(time.time())}"
                     
                     with tempfile.TemporaryDirectory() as tmpdirname:
-                        status_text.text(f"Rozpoczynam przetwarzanie {len(urls)} obrazów...")
+                        status_text.text(f"Inicjalizacja przetwarzania {len(urls)} obrazów...")
                         
-                        # Funkcja aktualizacji postępu
+                        # Pre-inicjalizacja FTP dla szybszego startu
+                        if debug_area:
+                            debug_area.info("Przygotowanie połączenia FTP...")
+                        try:
+                            ftp_manager = FTPManager.get_instance(st.session_state.ftp_settings)
+                            ftp_manager.connect()
+                        except Exception as e:
+                            if debug_area:
+                                debug_area.warning(f"Problem z wstępnym połączeniem FTP: {str(e)}")
+                        
+                        # Funkcja aktualizacji postępu z większą ilością szczegółów
                         def update_progress(progress_value, processed, total_processed, total):
                             progress_bar.progress(progress_value)
-                            status_text.text(f"Przetwarzanie... {total_processed}/{total} obrazów ({int(progress_value*100)}%)")
+                            percent = int(progress_value*100)
+                            elapsed_time = time.time() - start_time
+                            
+                            if processed > 0 and elapsed_time > 0:
+                                speed = processed / elapsed_time
+                                remaining = (total - processed) / speed if speed > 0 else 0
+                                time_info = f" | ~{int(remaining/60)}m {int(remaining%60)}s pozostało"
+                                speed_info = f" | {speed:.1f} obrazów/s"
+                            else:
+                                time_info = ""
+                                speed_info = ""
+                            
+                            status_text.text(f"Przetwarzanie... {total_processed}/{total} ({percent}%){speed_info}{time_info}")
+                        
+                        # Mierzenie czasu wykonania
+                        start_time = time.time()
                         
                         # Korzystamy z ulepszonej funkcji przetwarzania równoległego
                         new_urls_map, downloaded_images, failed_urls = process_images_in_parallel(
