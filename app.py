@@ -33,7 +33,9 @@ FTP_CONFIG = {
     'CONNECTION_TIMEOUT': 60,
     'MIN_WORKERS': 1,
     'MAX_WORKERS': 10,
-    'DEFAULT_WORKERS': 3
+    'DEFAULT_WORKERS': 3,
+    'KEEPALIVE_INTERVAL': 30,  # Interwał w sekundach dla keepalive
+    'IDLE_TIMEOUT': 300  # Timeout bezczynności w sekundach (5 minut)
 }
 
 class FTPManager:
@@ -58,7 +60,43 @@ class FTPManager:
         self.connection_semaphore = threading.BoundedSemaphore(self.connection_limit)
         self.error_count = 0
         self.last_error = None
+        self.keepalive_timer = None
+        self.idle_timer = None
         
+    def _start_keepalive(self):
+        """Rozpoczyna timer keepalive"""
+        if self.keepalive_timer:
+            self.keepalive_timer.cancel()
+        self.keepalive_timer = threading.Timer(FTP_CONFIG['KEEPALIVE_INTERVAL'], self._send_keepalive)
+        self.keepalive_timer.daemon = True
+        self.keepalive_timer.start()
+        
+    def _send_keepalive(self):
+        """Wysyła komendę NOOP do serwera FTP aby utrzymać połączenie"""
+        try:
+            with self.lock:
+                if self.connected and self.ftp:
+                    self.ftp.voidcmd('NOOP')
+                    self.last_activity = time.time()
+                    self._start_keepalive()
+        except Exception as e:
+            print(f"Błąd keepalive: {str(e)}")
+            self.connected = False
+            
+    def _start_idle_timer(self):
+        """Rozpoczyna timer bezczynności"""
+        if self.idle_timer:
+            self.idle_timer.cancel()
+        self.idle_timer = threading.Timer(FTP_CONFIG['IDLE_TIMEOUT'], self._handle_idle_timeout)
+        self.idle_timer.daemon = True
+        self.idle_timer.start()
+        
+    def _handle_idle_timeout(self):
+        """Obsługuje timeout bezczynności"""
+        with self.lock:
+            if time.time() - self.last_activity >= FTP_CONFIG['IDLE_TIMEOUT']:
+                self.close()
+                
     def verify_connection(self):
         """Weryfikuje połączenie FTP i zwraca szczegółowy status"""
         try:
@@ -92,8 +130,25 @@ class FTPManager:
                     except Exception as e:
                         print(f"Błąd podczas zamykania poprzedniego połączenia: {str(e)}")
                 
-                self.ftp = ftplib.FTP()
-                self.ftp.connect(self.settings["host"], self.settings["port"])
+                # Sprawdź czy używamy FTPS
+                use_tls = self.settings.get("use_tls", False)
+                if use_tls:
+                    self.ftp = ftplib.FTP_TLS()
+                else:
+                    self.ftp = ftplib.FTP()
+                
+                # Ustaw timeout połączenia
+                self.ftp.connect(
+                    self.settings["host"], 
+                    self.settings["port"], 
+                    timeout=FTP_CONFIG['CONNECTION_TIMEOUT']
+                )
+                
+                # Logowanie i konfiguracja TLS
+                if use_tls:
+                    self.ftp.auth()
+                    self.ftp.prot_p()  # Włącz ochronę danych
+                
                 self.ftp.login(self.settings["username"], self.settings["password"])
                 
                 # Optymalizacja ustawień FTP
@@ -114,6 +169,11 @@ class FTPManager:
                 self.connected = True
                 self.last_activity = time.time()
                 self.error_count = 0
+                
+                # Uruchom timery
+                self._start_keepalive()
+                self._start_idle_timer()
+                
                 return True
             except Exception as e:
                 self.last_error = str(e)
@@ -146,6 +206,7 @@ class FTPManager:
                         with self.lock:
                             self.ftp.storbinary(f'STOR {remote_filename}', file)
                             self.last_activity = time.time()
+                            self._start_idle_timer()  # Resetuj timer bezczynności
 
                     # Buduj URL
                     if self.settings.get("http_path"):
@@ -153,7 +214,8 @@ class FTPManager:
                         if not http_path.endswith('/'): http_path += '/'
                         image_url = f"{http_path}{remote_filename}"
                     else:
-                        image_url = f"ftp://{self.settings['host']}"
+                        scheme = "ftps" if self.settings.get("use_tls") else "ftp"
+                        image_url = f"{scheme}://{self.settings['host']}"
                         if self.settings["directory"] and self.settings["directory"] != "/":
                             if not self.settings["directory"].startswith("/"): image_url += "/"
                             image_url += self.settings["directory"]
@@ -177,10 +239,17 @@ class FTPManager:
     
     def close(self):
         with self.lock:
+            if self.keepalive_timer:
+                self.keepalive_timer.cancel()
+            if self.idle_timer:
+                self.idle_timer.cancel()
             if self.connected and self.ftp:
                 try: self.ftp.quit()
                 except: pass
                 self.connected = False
+                
+    def __del__(self):
+        self.close()
 
 class FTPBatchManager:
     """
@@ -424,63 +493,170 @@ def read_file_content(uploaded_file):
 
 def download_image(url, temp_dir):
     try:
+        # Walidacja URL
+        if not url or not url.strip():
+            return None, "Pusty URL"
+            
         parsed_url = urlparse(url)
         if not parsed_url.scheme or not parsed_url.netloc:
-            return None, f"Nieprawidłowy URL: {url}"
+            return None, f"Nieprawidłowy format URL: {url}"
 
         headers = {
-            "User-Agent": "Mozilla/5.0", "Accept": "*/*",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
             "Referer": f"{parsed_url.scheme}://{parsed_url.netloc}/"
         }
 
         # Specjalna obsługa dla image_show.php
         if "image_show.php" in url:
-            html_resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
-            html_resp.raise_for_status()
-            
-            soup = BeautifulSoup(html_resp.text, "html.parser")
-            img_tag = soup.find("img")
-            if not img_tag or not img_tag.get("src"):
-                return None, "Nie znaleziono znacznika <img> w odpowiedzi HTML"
+            try:
+                html_resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+                html_resp.raise_for_status()
+                
+                soup = BeautifulSoup(html_resp.text, "html.parser")
+                img_tag = soup.find("img")
+                if not img_tag or not img_tag.get("src"):
+                    return None, "Nie znaleziono znacznika <img> w odpowiedzi HTML"
 
-            img_src = img_tag["src"]
-            img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}" if not img_src.startswith("http") else img_src
+                img_src = img_tag["src"]
+                img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_src.lstrip('/')}" if not img_src.startswith("http") else img_src
+            except requests.exceptions.RequestException as e:
+                return None, f"Błąd pobierania strony HTML: {str(e)}"
         else:
             img_url = url
 
-        # Próby pobrania obrazu
+        # Próby pobrania obrazu z obsługą różnych scenariuszy
         for retry in range(3):
             try:
-                response = requests.get(img_url, headers=headers, stream=False, timeout=15, allow_redirects=True)
+                response = requests.get(img_url, headers=headers, stream=True, timeout=15, allow_redirects=True)
                 response.raise_for_status()
                 
-                content_type = response.headers.get("Content-Type", "")
-                if not content_type.startswith("image/") and retry < 2:
-                    continue
+                # Sprawdź typ zawartości
+                content_type = response.headers.get("Content-Type", "").lower()
                 
-                # Zapisz obraz
+                # Jeśli to nie jest obraz, ale mamy przekierowanie, spróbuj je obsłużyć
+                if not content_type.startswith("image/"):
+                    if retry < 2:
+                        if 'location' in response.headers:
+                            img_url = response.headers['location']
+                            continue
+                        elif content_type.startswith("text/html"):
+                            # Spróbuj znaleźć obraz w HTML
+                            soup = BeautifulSoup(response.text, "html.parser")
+                            img_tag = soup.find("img")
+                            if img_tag and img_tag.get("src"):
+                                img_url = img_tag["src"]
+                                if not img_url.startswith("http"):
+                                    img_url = f"{parsed_url.scheme}://{parsed_url.netloc}/{img_url.lstrip('/')}"
+                                continue
+                    return None, f"Nieprawidłowy typ zawartości: {content_type}"
+                
+                # Określ rozszerzenie pliku
                 extension = {
-                    "image/jpeg": ".jpg", "image/png": ".png",
-                    "image/gif": ".gif", "image/webp": ".webp"
+                    "image/jpeg": ".jpg",
+                    "image/png": ".png",
+                    "image/gif": ".gif",
+                    "image/webp": ".webp",
+                    "image/bmp": ".bmp",
+                    "image/tiff": ".tiff"
                 }.get(content_type, ".jpg")
                 
+                # Generuj unikalną nazwę pliku
                 filename = f"image_{uuid.uuid4().hex}{extension}"
                 file_path = os.path.join(temp_dir, filename)
                 
+                # Zapisz plik z weryfikacją rozmiaru
                 with open(file_path, "wb") as f:
-                    f.write(response.content)
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
                 
-                if os.path.exists(file_path) and os.path.getsize(file_path) > 100:
+                # Sprawdź czy plik został poprawnie zapisany
+                if os.path.exists(file_path):
+                    file_size = os.path.getsize(file_path)
+                    if file_size < 100:  # Plik jest podejrzanie mały
+                        os.remove(file_path)
+                        if retry < 2:
+                            continue
+                        return None, "Pobrany plik jest zbyt mały"
+                    elif file_size > 20 * 1024 * 1024:  # Większy niż 20MB
+                        os.remove(file_path)
+                        return None, "Plik jest zbyt duży (>20MB)"
                     return {"path": file_path, "filename": filename, "original_url": url}, None
                 else:
-                    return None, "Pobrano pusty lub niepełny plik"
+                    return None, "Nie udało się zapisać pliku"
                     
-            except Exception as e:
+            except requests.exceptions.RequestException as e:
                 if retry == 2:
-                    return None, f"Błąd przy pobieraniu: {str(e)}"
+                    return None, f"Błąd pobierania obrazu: {str(e)}"
+                time.sleep(retry + 1)  # Zwiększające się opóźnienie między próbami
     
     except Exception as e:
-        return None, f"Błąd: {str(e)}"
+        return None, f"Nieoczekiwany błąd: {str(e)}"
+
+def process_single_url(url, retry_count=0, temp_dir=None, max_retries=3, debug_container=None):
+    """Pomocnicza funkcja do przetwarzania pojedynczego URL"""
+    try:
+        if debug_container:
+            debug_container.info(f"⬇️ Pobieranie: {url}")
+            
+        image_info, error = download_image(url, temp_dir)
+        
+        if error:
+            if retry_count < max_retries:
+                if debug_container:
+                    debug_container.info(f"🔄 Ponawiam {retry_count + 1}/{max_retries} dla {url}: {error}")
+                return {
+                    "status": "retry",
+                    "url": url,
+                    "retry_count": retry_count + 1,
+                    "error": error
+                }
+            else:
+                if debug_container:
+                    debug_container.warning(f"❌ Błąd pobierania dla {url}: {error}")
+                return {
+                    "status": "error",
+                    "url": url,
+                    "error": error
+                }
+        
+        if not image_info or not image_info.get("path"):
+            return {
+                "status": "error",
+                "url": url,
+                "error": "Brak informacji o pobranym pliku"
+            }
+            
+        if debug_container:
+            debug_container.success(f"✅ Pobrano: {url}")
+            
+        return {
+            "status": "success",
+            "url": url,
+            "image_info": image_info
+        }
+        
+    except Exception as e:
+        if retry_count < max_retries:
+            if debug_container:
+                debug_container.info(f"🔄 Ponawiam {retry_count + 1}/{max_retries} dla {url}: {str(e)}")
+            return {
+                "status": "retry",
+                "url": url,
+                "retry_count": retry_count + 1,
+                "error": str(e)
+            }
+        else:
+            if debug_container:
+                debug_container.error(f"⛔ Błąd dla {url}: {str(e)}")
+            return {
+                "status": "error",
+                "url": url,
+                "error": str(e)
+            }
 
 def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, debug_container=None, max_retries=3, progress_callback=None):
     # Użyj domyślnej wartości jeśli nie podano max_workers
@@ -533,98 +709,6 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
     ftp_tasks = {}
     ftp_results_lock = threading.Lock()
     
-    def process_single_url(url, retry_count=0):
-        nonlocal processed_count
-        try:
-            # Download image
-            if debug_container:
-                debug_container.info(f"⬇️ Pobieranie: {url}")
-                
-            image_info, error = download_image(url, temp_dir)
-            if error:
-                if retry_count < max_retries:
-                    return {"status": "retry", "url": url, "retry_count": retry_count + 1, 
-                            "error": f"Download error: {error}"}
-                else:
-                    return {"status": "download_error", "url": url, "error": error}
-            
-            if debug_container:
-                debug_container.info(f"🔄 Dodawanie do kolejki FTP: {url}")
-            
-            # Dodaj zadanie do kolejki FTP i zapamiętaj ID zadania
-            task_id = ftp_batch_manager.add_upload_task(image_info["path"])
-            
-            return {
-                "status": "queued_ftp", 
-                "url": url,
-                "task_id": task_id, 
-                "file_path": image_info["path"],
-                "retry_count": retry_count
-            }
-        except Exception as e:
-            if retry_count < max_retries:
-                return {"status": "retry", "url": url, "retry_count": retry_count + 1, 
-                        "error": f"Exception: {str(e)}"}
-            else:
-                return {"status": "error", "url": url, "error": str(e)}
-    
-    # Sprawdzanie statusu zadań FTP z uwzględnieniem statystyk
-    def check_ftp_tasks():
-        tasks_to_remove = []
-        retry_tasks = []
-        
-        stats = ftp_batch_manager.get_stats()
-        if debug_container and stats['total_uploaded'] > 0:
-            upload_rate = stats['upload_rate']
-            elapsed_time = stats['elapsed_time']
-            debug_container.info(f"📊 Statystyki FTP:")
-            debug_container.info(f"- Przesłano: {stats['total_uploaded']}")
-            debug_container.info(f"- Błędy: {stats['failed_uploads']}")
-            debug_container.info(f"- Ponowienia: {stats['retry_count']}")
-            debug_container.info(f"- Szybkość: {upload_rate:.2f} plików/s")
-            if elapsed_time > 0:
-                debug_container.info(f"- Czas: {int(elapsed_time/60)}m {int(elapsed_time%60)}s")
-        
-        with ftp_results_lock:
-            for url, task_data in ftp_tasks.items():
-                task_id = task_data["task_id"]
-                retry_count = task_data["retry_count"]
-                result = ftp_batch_manager.get_result(task_id)
-                
-                if not result or result.get("status") == "queued" or result.get("status") == "uploading":
-                    continue
-                    
-                tasks_to_remove.append(url)
-                
-                if result.get("status") == "success":
-                    new_urls_map[url] = result.get("url")
-                    downloaded_images.append({
-                        "original_url": url, 
-                        "ftp_url": result.get("url"),
-                        "filename": result.get("filename")
-                    })
-                    nonlocal processed_count
-                    processed_count += 1
-                    if debug_container:
-                        debug_container.success(f"✅ Pobrano i przesłano: {url}")
-                else:
-                    error = result.get("error", "Nieznany błąd przesyłania")
-                    if retry_count < max_retries:
-                        if debug_container:
-                            debug_container.info(f"🔄 Ponawiam FTP {retry_count+1}/{max_retries} dla {url}: {error}")
-                        retry_tasks.append((url, retry_count + 1))
-                    else:
-                        failed_urls.append({"url": url, "error": error})
-                        processed_count += 1
-                        if debug_container:
-                            debug_container.warning(f"❌ Błąd przesyłania FTP dla {url}: {error}")
-            
-            for url in tasks_to_remove:
-                del ftp_tasks[url]
-                
-        for url, retry_count in retry_tasks:
-            retry_queue.put((url, retry_count))
-    
     # Dodajemy tylko początkowy batch URL-i
     initial_batch_size = min(max_workers * 2, total_urls)
     for url in urls[:initial_batch_size]:
@@ -650,7 +734,7 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
                 debug_container.info(f"📋 W kolejce pobierania: {queue_size} | W kolejce FTP: {ftp_queue_size} | Zaplanowano: {next_url_index}/{total_urls}")
             
             if retry_queue.empty() and next_url_index >= total_urls and ftp_tasks:
-                time.sleep(0.1)  # Zmniejszone opóźnienie
+                time.sleep(0.1)
                 continue
             
             # Get batch of URLs from queue
@@ -664,25 +748,35 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
                 if next_url_index < total_urls:
                     continue
                 elif ftp_tasks:
-                    time.sleep(0.1)  # Zmniejszone opóźnienie
+                    time.sleep(0.1)
                     continue
                 else:
                     break
             
             # Process batch
-            futures = {executor.submit(process_single_url, url, retry_count): (url, retry_count) 
-                      for url, retry_count in batch}
+            futures = {
+                executor.submit(
+                    process_single_url,
+                    url=url,
+                    retry_count=retry_count,
+                    temp_dir=temp_dir,
+                    max_retries=max_retries,
+                    debug_container=debug_container
+                ): (url, retry_count) for url, retry_count in batch
+            }
             
             for future in concurrent.futures.as_completed(futures):
                 url, retry_count = futures[future]
                 try:
                     result = future.result()
                     
-                    if result["status"] == "queued_ftp":
+                    if result["status"] == "success":
+                        # Dodaj zadanie do kolejki FTP
+                        task_id = ftp_batch_manager.add_upload_task(result["image_info"]["path"])
                         with ftp_results_lock:
                             ftp_tasks[url] = {
-                                "task_id": result["task_id"],
-                                "file_path": result["file_path"],
+                                "task_id": task_id,
+                                "file_path": result["image_info"]["path"],
                                 "retry_count": retry_count
                             }
                         if debug_container:
@@ -690,9 +784,9 @@ def process_images_in_parallel(urls, temp_dir, ftp_settings, max_workers=None, d
                     elif result["status"] == "retry":
                         if debug_container:
                             debug_container.info(f"🔄 Ponawiam {result['retry_count']}/{max_retries} dla {url}: {result.get('error')}")
-                        time.sleep(random.uniform(0.5, 1.0))  # Opóźnienie przed ponowieniem
+                        time.sleep(random.uniform(0.5, 1.0))
                         retry_queue.put((url, result["retry_count"]))
-                    else:
+                    else  # error
                         failed_urls.append({"url": url, "error": result.get("error", "Nieznany błąd")})
                         processed_count += 1
                         if debug_container:
